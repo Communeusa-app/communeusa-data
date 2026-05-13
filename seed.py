@@ -16,7 +16,10 @@ import sys
 from pathlib import Path
 from typing import Optional
 
+from dotenv import load_dotenv
 from supabase import create_client, Client
+
+load_dotenv(Path(__file__).parent / ".env")
 
 OUTPUT_DIR = Path(__file__).parent / "output"
 
@@ -83,22 +86,23 @@ def seed_state(supabase: Client) -> str:
     return wa_id
 
 
+ALL_WA_COUNTIES = [
+    "Adams", "Asotin", "Benton", "Chelan", "Clallam", "Clark", "Columbia",
+    "Cowlitz", "Douglas", "Ferry", "Franklin", "Garfield", "Grant",
+    "Grays Harbor", "Island", "Jefferson", "King", "Kitsap", "Kittitas",
+    "Klickitat", "Lewis", "Lincoln", "Mason", "Okanogan", "Pacific",
+    "Pend Oreille", "Pierce", "San Juan", "Skagit", "Skamania", "Snohomish",
+    "Spokane", "Stevens", "Thurston", "Wahkiakum", "Walla Walla", "Whatcom",
+    "Whitman", "Yakima",
+]
+
+
 def seed_counties(supabase: Client, wa_id: str) -> dict[str, str]:
     """
-    Upsert counties derived from county_officials.json.
+    Upsert all 39 WA counties. Existing rows are skipped via on_conflict.
     Returns a dict mapping county name → UUID.
     """
-    co_data = load("county_officials.json")
-
-    # Skip rows where the county field is a note or reference link
-    skip_fragments = ("🔄", "wa.gov", "ballotpedia", "See ")
-    names = sorted({
-        r["county"]
-        for r in co_data
-        if r.get("county") and not any(f in r["county"] for f in skip_fragments)
-    })
-
-    rows = [{"state_id": wa_id, "name": name} for name in names]
+    rows = [{"state_id": wa_id, "name": name} for name in ALL_WA_COUNTIES]
     res = (
         supabase.table("counties")
         .upsert(rows, on_conflict="state_id,name")
@@ -248,9 +252,9 @@ def seed_federal_legislators(supabase: Client, wa_id: str) -> None:
 
 def main() -> None:
     url = os.environ.get("SUPABASE_URL")
-    key = os.environ.get("SUPABASE_ANON_KEY")
+    key = os.environ.get("SUPABASE_SERVICE_KEY")
     if not url or not key:
-        sys.exit("ERROR: SUPABASE_URL and SUPABASE_ANON_KEY must be set")
+        sys.exit("ERROR: SUPABASE_URL and SUPABASE_SERVICE_KEY must be set")
 
     supabase: Client = create_client(url, key)
     print("Connected to Supabase. Seeding...\n")
