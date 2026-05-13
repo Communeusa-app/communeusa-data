@@ -16,6 +16,20 @@ SHEET_MAP = {
     "Federal Legislators": "federal_legislators.json",
 }
 
+VOTING_SHEETS = ["Voting Record", "Voting Record1"]
+
+# Maps cleaned Excel column names → voting_records schema fields
+VOTING_COL_MAP = {
+    "official_name":      "official_name",
+    "bill_motion":        "bill_name",
+    "topic_category":     "topic_category",
+    "date":               "vote_date",
+    "their_vote":         "vote_cast",
+    "result":             "result",
+    "constituent_impact": "constituent_impact",
+    "source_url":         "source_url",
+}
+
 
 def clean_header(raw):
     if raw is None:
@@ -100,6 +114,36 @@ def extract_records(ws):
     return records
 
 
+def extract_voting_records(wb):
+    all_records = []
+    for sheet_key in VOTING_SHEETS:
+        ws = find_sheet(wb, sheet_key)
+        if ws is None:
+            print(f"  WARN  sheet not found: {sheet_key}")
+            continue
+        raw = extract_records(ws)
+        count = 0
+        for rec in raw:
+            mapped = {
+                "official_name":    rec.get("official_name"),
+                "official_id":      None,
+                "bill_name":        rec.get("bill_motion"),
+                "bill_description": None,
+                "topic_category":   rec.get("topic_category"),
+                "vote_date":        rec.get("date"),
+                "vote_cast":        rec.get("their_vote"),
+                "result":           rec.get("result"),
+                "constituent_impact": rec.get("constituent_impact"),
+                "source_url":       rec.get("source_url"),
+            }
+            if not mapped["official_name"] and not mapped["bill_name"]:
+                continue
+            all_records.append(mapped)
+            count += 1
+        print(f"  OK    {sheet_key} → {count} records extracted")
+    return all_records
+
+
 def main():
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     wb = openpyxl.load_workbook(XLSX_PATH, data_only=True)
@@ -117,6 +161,12 @@ def main():
             json.dump(records, f, indent=2, ensure_ascii=False)
 
         print(f"  OK    {sheet_name} → {output_file} ({len(records)} records)")
+
+    voting_records = extract_voting_records(wb)
+    out_path = OUTPUT_DIR / "voting_records.json"
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump(voting_records, f, indent=2, ensure_ascii=False)
+    print(f"  OK    voting records → voting_records.json ({len(voting_records)} total)")
 
 
 if __name__ == "__main__":
