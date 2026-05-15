@@ -277,8 +277,12 @@ def get_wa_state_id(supabase: Client) -> str:
 
 def get_existing_officials(supabase: Client, level: str) -> dict[str, dict]:
     """
-    Return {official_name: row_dict} for all officials at the given level.
+    Return {official_name: canonical_row} for all officials at the given level.
     Includes inactive officials so we can reactivate if they return.
+
+    When multiple rows share a name (stale duplicates from earlier seeds), the
+    active row is preferred. If multiple are active, all but the first are
+    deactivated immediately so the rest of the sync operates on one row per name.
     """
     res = (
         supabase.table("officials")
@@ -286,7 +290,28 @@ def get_existing_officials(supabase: Client, level: str) -> dict[str, dict]:
         .eq("level", level)
         .execute()
     )
-    return {r["official_name"]: r for r in (res.data or [])}
+
+    # Group by name, preserving DB order
+    by_name: dict[str, list[dict]] = {}
+    for r in res.data or []:
+        by_name.setdefault(r["official_name"], []).append(r)
+
+    canonical: dict[str, dict] = {}
+    for name, rows in by_name.items():
+        active = [r for r in rows if r.get("is_active")]
+        if len(active) == 1:
+            canonical[name] = active[0]
+        elif len(active) > 1:
+            # Keep the first active row; deactivate the rest
+            canonical[name] = active[0]
+            for stale in active[1:]:
+                supabase.table("officials").update({"is_active": False}).eq("id", stale["id"]).execute()
+                log.warning("Deactivated duplicate active row for %r (id=%s)", name, stale["id"])
+        else:
+            # All inactive — keep first for potential reactivation
+            canonical[name] = rows[0]
+
+    return canonical
 
 
 # ── Core sync logic ───────────────────────────────────────────────────────────

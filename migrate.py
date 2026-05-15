@@ -30,6 +30,32 @@ VOTING_COL_MAP = {
     "source_url":         "source_url",
 }
 
+CAMPAIGN_FINANCE_SHEETS = ["Campaign Funding", "Campaign Funding1"]
+
+# Per-sheet column maps: cleaned Excel header → campaign_finance schema field.
+# Sheet 1 uses older column names; sheet 2 uses the canonical schema names.
+CAMPAIGN_COL_MAPS = {
+    "Campaign Funding": {
+        "official_name":      "official_name",
+        "top_donor_category": "donor_name",
+        "donor_type":         "donor_type",
+        "amount":             "amount",
+        "election_year":      "election_cycle",
+        "industry_sector":    "industry_sector",
+        "pdc_fec_filing":     "source_url",
+    },
+    "Campaign Funding1": {
+        "official_name":  "official_name",
+        "donor_name":     "donor_name",
+        "donor_type":     "donor_type",
+        "amount":         "amount",
+        "election_cycle": "election_cycle",
+        "date":           "donation_date",
+        "industry_sector": "industry_sector",
+        "source_url":     "source_url",
+    },
+}
+
 
 def clean_header(raw):
     if raw is None:
@@ -144,6 +170,73 @@ def extract_voting_records(wb):
     return all_records
 
 
+def parse_amount(val):
+    """Return a numeric value from strings like '~$1,200,000' or plain numbers."""
+    if val is None:
+        return None
+    if isinstance(val, (int, float)):
+        return int(val) if isinstance(val, float) and val == int(val) else val
+    s = str(val).replace("~", "").replace("$", "").replace(",", "").strip()
+    try:
+        f = float(s)
+        return int(f) if f == int(f) else f
+    except (ValueError, OverflowError):
+        return None
+
+
+def _is_placeholder_official(name) -> bool:
+    """Return True for rows that are instructions or catch-all entries, not real officials."""
+    if not name:
+        return True
+    n = str(name).strip().lower()
+    return (
+        n.startswith("n/a")
+        or n.startswith("search")
+        or "pdc.wa.gov" in n
+        or n == ""
+    )
+
+
+def extract_campaign_finance(wb):
+    all_records = []
+    for sheet_key in CAMPAIGN_FINANCE_SHEETS:
+        ws = find_sheet(wb, sheet_key)
+        if ws is None:
+            print(f"  WARN  sheet not found: {sheet_key}")
+            continue
+        col_map = CAMPAIGN_COL_MAPS[sheet_key]
+        raw = extract_records(ws)
+        count = 0
+        for rec in raw:
+            official_name = rec.get("official_name")
+            if _is_placeholder_official(official_name):
+                continue
+
+            mapped = {
+                "official_name":   official_name,
+                "official_id":     None,
+                "donor_name":      None,
+                "donor_type":      None,
+                "amount":          None,
+                "election_cycle":  None,
+                "donation_date":   None,
+                "industry_sector": None,
+                "source_url":      None,
+                "filing_source":   None,
+            }
+            for excel_col, target_field in col_map.items():
+                val = rec.get(excel_col)
+                if target_field == "amount":
+                    mapped["amount"] = parse_amount(val)
+                else:
+                    mapped[target_field] = val
+
+            all_records.append(mapped)
+            count += 1
+        print(f"  OK    {sheet_key} → {count} records extracted")
+    return all_records
+
+
 def main():
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     wb = openpyxl.load_workbook(XLSX_PATH, data_only=True)
@@ -167,6 +260,12 @@ def main():
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump(voting_records, f, indent=2, ensure_ascii=False)
     print(f"  OK    voting records → voting_records.json ({len(voting_records)} total)")
+
+    campaign_finance = extract_campaign_finance(wb)
+    out_path = OUTPUT_DIR / "campaign_finance.json"
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump(campaign_finance, f, indent=2, ensure_ascii=False)
+    print(f"  OK    campaign finance → campaign_finance.json ({len(campaign_finance)} total)")
 
 
 if __name__ == "__main__":
