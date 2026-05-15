@@ -103,10 +103,12 @@ def make_session() -> requests.Session:
     s = requests.Session()
     s.headers.update({
         "User-Agent": (
-            "CommuneUSA-elections-sync/1.0 "
-            "(civic data aggregator; contact jacksonsharkey@hotmail.com)"
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0.0.0 Safari/537.36"
         ),
-        "Accept": "text/html,application/xhtml+xml",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
     })
     return s
 
@@ -117,10 +119,9 @@ def get_html(url: str, session: requests.Session, *, delay: bool = True) -> Opti
         time.sleep(REQUEST_DELAY)
     try:
         resp = session.get(url, timeout=30, allow_redirects=True)
-        if resp.status_code == 404:
-            log.debug("404 — %s", url)
+        if resp.status_code != 200:
+            log.debug("HTTP %d — %s", resp.status_code, url)
             return None
-        resp.raise_for_status()
         return BeautifulSoup(resp.text, "html.parser")
     except Exception as exc:
         log.warning("HTTP error fetching %s: %s", url, exc)
@@ -182,10 +183,288 @@ def _bp_content(soup: BeautifulSoup) -> Tag:
     return soup.find("div", {"id": "mw-content-text"}) or soup
 
 
-def fetch_bp_wa_race_urls(session: requests.Session) -> list[dict]:
+def _normalise_party_abbrev(abbrev: str) -> Optional[str]:
+    """Expand single-letter party abbreviations like D, R, L, G."""
+    mapping = {
+        "d": "Democratic", "dem": "Democratic",
+        "r": "Republican", "rep": "Republican", "gop": "Republican",
+        "i": "Independent", "ind": "Independent",
+        "l": "Libertarian", "lib": "Libertarian",
+        "g": "Green", "grn": "Green",
+        "np": "Nonpartisan",
+    }
+    return mapping.get(abbrev.lower().strip())
+
+
+def _parse_name_party_incumbent(raw: str) -> tuple[str, Optional[str], bool]:
     """
-    Scrape the WA 2026 elections overview page and return a list of
-    {name, url, raw_section} dicts for each linked race page.
+    Parse strings like 'Jeff Holy(i)', 'Marie Gluesenkamp Pérez(D)', 'Bob(R)(i)'.
+    Returns (clean_name, party_or_None, is_incumbent).
+    """
+    is_incumbent = bool(re.search(r"\(i\)", raw, re.IGNORECASE))
+    text = re.sub(r"\(i\)", "", raw, flags=re.IGNORECASE).strip()
+
+    party_match = re.search(r"\(([A-Za-z]+)\)\s*$", text)
+    party = None
+    if party_match:
+        abbrev = party_match.group(1)
+        party = _normalise_party_abbrev(abbrev) or _normalise_party(abbrev)
+        text = text[: party_match.start()].strip()
+
+    return text, party, is_incumbent
+
+
+def _parse_partisan_table(soup: BeautifulSoup, category_url: str) -> list[dict]:
+    """
+    Parse a Ballotpedia category page that uses candidateListTablePartisan.
+    Each row is one district; columns are Office + one per party.
+    Returns list of race dicts {office_name, candidates, election_date, source_url, description}.
+    """
+    races = []
+    for table in soup.find_all("table", class_=re.compile(r"candidateListTable", re.IGNORECASE)):
+        header_row = table.find("tr")
+        if not header_row:
+            continue
+        headers = [th.get_text(strip=True) for th in header_row.find_all(["th", "td"])]
+
+        col_office = 0
+        col_parties: list[tuple[int, str]] = []
+        for i, h in enumerate(headers):
+            hl = h.lower()
+            if any(k in hl for k in ("office", "district", "seat", "position")):
+                col_office = i
+            elif h:
+                col_parties.append((i, h))
+
+        for row in table.find_all("tr")[1:]:
+            cells = row.find_all(["td", "th"])
+            if len(cells) <= col_office:
+                continue
+
+            office_cell = cells[col_office]
+            office_text = office_cell.get_text(strip=True)
+            if not office_text:
+                continue
+
+            office_link = office_cell.find("a", href=True)
+            office_url = (
+                f"{BP_BASE}{office_link['href']}"
+                if office_link and office_link["href"].startswith("/")
+                else None
+            )
+
+            candidates: list[dict] = []
+            seen_names: set[str] = set()
+
+            for col_idx, party_label in col_parties:
+                if col_idx >= len(cells):
+                    continue
+                cell = cells[col_idx]
+
+                links = cell.find_all("a", href=True)
+                raw_entries: list[tuple[str, Optional[str]]] = []
+                if links:
+                    for link in links:
+                        text = link.get_text(strip=True)
+                        href = link["href"]
+                        bp_url = f"{BP_BASE}{href}" if href.startswith("/") else None
+                        if text:
+                            raw_entries.append((text, bp_url))
+                else:
+                    cell_text = cell.get_text(strip=True)
+                    if cell_text:
+                        raw_entries.append((cell_text, None))
+
+                for raw_text, bp_url in raw_entries:
+                    name, cand_party, is_incumbent = _parse_name_party_incumbent(raw_text)
+                    if not name or name.lower() in seen_names:
+                        continue
+                    seen_names.add(name.lower())
+
+                    if party_label.lower() == "other":
+                        final_party = cand_party
+                    else:
+                        final_party = cand_party or _normalise_party(party_label)
+
+                    candidates.append({
+                        "name":         name,
+                        "party":        final_party,
+                        "is_incumbent": is_incumbent,
+                        "bp_url":       bp_url,
+                    })
+
+            if not candidates:
+                continue
+
+            races.append({
+                "office_name":   office_text,
+                "candidates":    candidates,
+                "election_date": ELECTION_DATE_GENERAL,
+                "source_url":    office_url or category_url,
+                "description":   None,
+            })
+
+    return races
+
+
+def _parse_results_table_candidates(soup: BeautifulSoup) -> list[dict]:
+    """Parse candidates from results_table on individual Ballotpedia race pages."""
+    candidates: list[dict] = []
+    seen_names: set[str] = set()
+    skip = {"candidate", "party", "votes", "pct", "%", "total", ""}
+
+    for table in soup.find_all("table", class_=re.compile(r"results_table", re.IGNORECASE)):
+        for row in table.find_all("tr"):
+            for cell in row.find_all(["td", "th"]):
+                raw = cell.get_text(strip=True)
+                if not raw:
+                    continue
+                name, party, is_incumbent = _parse_name_party_incumbent(raw)
+                if not name or len(name) < 2 or name.lower() in seen_names:
+                    continue
+                if name.lower() in skip:
+                    continue
+                seen_names.add(name.lower())
+                link = cell.find("a", href=True)
+                bp_url = (
+                    f"{BP_BASE}{link['href']}"
+                    if link and link["href"].startswith("/")
+                    else None
+                )
+                candidates.append({
+                    "name":         name,
+                    "party":        party,
+                    "is_incumbent": is_incumbent,
+                    "bp_url":       bp_url,
+                })
+
+    return candidates
+
+
+def _fetch_individual_race(url: str, session: requests.Session) -> Optional[dict]:
+    """
+    Fetch a single Ballotpedia race page and extract office name + candidates.
+    Tries results_table first, then falls back to generic candidate-column tables.
+    """
+    soup = get_html(url, session)
+    if not soup:
+        return None
+
+    h1 = soup.find("h1", {"id": "firstHeading"}) or soup.find("h1")
+    office_name = h1.get_text(strip=True) if h1 else ""
+    office_name = re.sub(
+        r",?\s*(election[,]?\s*)?2026$", "", office_name, flags=re.IGNORECASE
+    ).strip()
+
+    candidates = _parse_results_table_candidates(soup)
+
+    if not candidates:
+        seen_names: set[str] = set()
+        for table in soup.find_all("table"):
+            headers = [th.get_text(strip=True).lower() for th in table.find_all("th")]
+            joined = " ".join(headers)
+            if "candidate" not in joined:
+                continue
+            cand_col = next((i for i, h in enumerate(headers) if "candidate" in h), None)
+            party_col = next((i for i, h in enumerate(headers) if "party" in h), None)
+            if cand_col is None:
+                continue
+            for row in table.find_all("tr")[1:]:
+                cells = row.find_all(["td", "th"])
+                if len(cells) <= cand_col:
+                    continue
+                cell = cells[cand_col]
+                raw = cell.get_text(strip=True)
+                if not raw or len(raw) < 2:
+                    continue
+                is_inc = bool(re.search(r"\(i\)", raw, re.IGNORECASE))
+                name = re.sub(r"\s*\([Ii]\)\s*$", "", raw).strip()
+                name = re.sub(r"\s*\*+\s*$", "", name).strip()
+                if not name or name.lower() in seen_names:
+                    continue
+                seen_names.add(name.lower())
+                link = cell.find("a", href=True)
+                bp_url = (
+                    f"{BP_BASE}{link['href']}"
+                    if link and link["href"].startswith("/")
+                    else None
+                )
+                party = ""
+                if party_col is not None and len(cells) > party_col:
+                    party = cells[party_col].get_text(strip=True)
+                candidates.append({
+                    "name":         name,
+                    "party":        _normalise_party(party),
+                    "is_incumbent": is_inc,
+                    "bp_url":       bp_url,
+                })
+
+    description = None
+    for p in _bp_content(soup).find_all("p"):
+        txt = p.get_text(strip=True)
+        if len(txt) > 40:
+            description = txt[:400]
+            break
+
+    log.info("  Race: %-55s  candidates: %d", (office_name or url)[:55], len(candidates))
+    return {
+        "office_name":   office_name,
+        "candidates":    candidates,
+        "election_date": ELECTION_DATE_GENERAL,
+        "source_url":    url,
+        "description":   description,
+    }
+
+
+def _fetch_category_races(category_url: str, session: requests.Session) -> list[dict]:
+    """
+    Fetch one Ballotpedia category page and return all races found.
+    If the page has a candidateListTablePartisan, parse it directly.
+    Otherwise follow individual race links.
+    """
+    soup = get_html(category_url, session)
+    if not soup:
+        log.warning("Could not fetch category page: %s", category_url)
+        return []
+
+    label = category_url.split("/")[-1]
+
+    if soup.find("table", class_=re.compile(r"candidateListTable", re.IGNORECASE)):
+        races = _parse_partisan_table(soup, category_url)
+        log.info("  Category %-50s  partisan table → %d races", label[:50], len(races))
+        return races
+
+    # Fall back to individual race links
+    content = _bp_content(soup)
+    seen: set[str] = set()
+    race_links: list[tuple[str, str]] = []
+    for a in content.find_all("a", href=True):
+        href = a["href"]
+        if not href.startswith("/") or ":" in href or "2026" not in href:
+            continue
+        if href in seen:
+            continue
+        text = a.get_text(strip=True)
+        if not text or len(text) < 5:
+            continue
+        seen.add(href)
+        race_links.append((f"{BP_BASE}{href}", text))
+
+    log.info("  Category %-50s  individual links → %d", label[:50], len(race_links))
+    races = []
+    for race_url, _ in race_links:
+        detail = _fetch_individual_race(race_url, session)
+        if detail:
+            races.append(detail)
+    return races
+
+
+def fetch_bp_wa_races(session: requests.Session) -> list[dict]:
+    """
+    Orchestrate WA 2026 race collection from Ballotpedia.
+    1. Fetch overview page → extract marqueetable category links.
+    2. For each category page, delegate to _fetch_category_races().
+    Returns list of race dicts {office_name, candidates, election_date, source_url, description}.
     """
     soup = get_html(BP_WA_2026, session, delay=False)
     if not soup:
@@ -193,200 +472,29 @@ def fetch_bp_wa_race_urls(session: requests.Session) -> list[dict]:
         return []
 
     content = _bp_content(soup)
-    races: list[dict] = []
-    seen_urls: set[str] = set()
+    if not content:
+        log.error("mw-content-text div missing — possible bot challenge response")
+        return []
 
-    # Current section heading as context for level guessing
-    current_section = ""
+    seen: set[str] = set()
+    category_urls: list[str] = []
 
-    for el in content.find_all(["h2", "h3", "h4", "a"]):
-        if el.name in ("h2", "h3", "h4"):
-            current_section = el.get_text(strip=True).lower()
-            continue
+    marquee = content.find("table", class_=re.compile(r"marqueetable", re.IGNORECASE))
+    source = marquee if marquee else content
+    for a in source.find_all("a", href=True):
+        href = a["href"]
+        if href.startswith("/") and ":" not in href and href not in seen:
+            seen.add(href)
+            category_urls.append(f"{BP_BASE}{href}")
 
-        if el.name != "a":
-            continue
+    log.info("Ballotpedia overview: %d category links", len(category_urls))
 
-        href = el.get("href", "")
-        text = el.get_text(strip=True)
+    all_races: list[dict] = []
+    for cat_url in category_urls:
+        all_races.extend(_fetch_category_races(cat_url, session))
 
-        # Only follow links to Ballotpedia race pages for 2026
-        if not href or href in seen_urls:
-            continue
-        if not text or len(text) < 8:
-            continue
-
-        # Relative Ballotpedia links that look like race pages
-        is_bp_internal = (
-            href.startswith("/") and
-            not href.startswith("//") and
-            not href.startswith("/wiki/") and
-            ":" not in href
-        )
-        if not is_bp_internal:
-            continue
-
-        # Must reference 2026 or be in a 2026-elections context
-        full_url = f"{BP_BASE}{href}"
-        if "2026" not in full_url and "2026" not in text:
-            continue
-
-        # Skip non-race links (categories, templates, help pages)
-        skip_patterns = ["Category:", "Template:", "Help:", "File:", "Special:"]
-        if any(p in href for p in skip_patterns):
-            continue
-
-        seen_urls.add(href)
-        races.append({
-            "name":        text,
-            "url":         full_url,
-            "raw_section": current_section,
-        })
-
-    log.info("Ballotpedia overview: found %d race links", len(races))
-    return races
-
-
-def fetch_bp_race_detail(url: str, session: requests.Session) -> dict:
-    """
-    Scrape a Ballotpedia race page and return:
-      {
-        office_name, candidates: [{name, party, is_incumbent, bp_url}],
-        election_date, description
-      }
-    Returns empty dict on failure.
-    """
-    soup = get_html(url, session)
-    if not soup:
-        return {}
-
-    # Office name from page title (h1)
-    h1 = soup.find("h1", {"id": "firstHeading"}) or soup.find("h1")
-    office_name = h1.get_text(strip=True) if h1 else ""
-
-    # Strip common suffixes like ", 2026" or " election, 2026"
-    office_name = re.sub(r",?\s*(election[,]?\s*)?2026$", "", office_name, flags=re.IGNORECASE).strip()
-
-    # Infobox election date
-    election_date = ELECTION_DATE_GENERAL
-    infobox = soup.find("table", class_=re.compile(r"infobox|wikitable"))
-    if infobox:
-        for row in infobox.find_all("tr"):
-            cells = row.find_all(["th", "td"])
-            label_text = cells[0].get_text(strip=True).lower() if cells else ""
-            if "election day" in label_text or "general" in label_text:
-                if len(cells) > 1:
-                    raw_date = cells[1].get_text(strip=True)
-                    parsed = _parse_date(raw_date)
-                    if parsed:
-                        election_date = parsed
-
-    # Candidates — try multiple common Ballotpedia table formats
-    candidates: list[dict] = []
-    seen_names: set[str] = set()
-
-    # Format 1: table with "Candidate" and "Party" columns
-    for table in soup.find_all("table"):
-        headers = [th.get_text(strip=True).lower() for th in table.find_all("th")]
-        if "candidate" not in " ".join(headers):
-            continue
-
-        candidate_col = next(
-            (i for i, h in enumerate(headers) if "candidate" in h), None
-        )
-        party_col = next(
-            (i for i, h in enumerate(headers) if "party" in h), None
-        )
-        if candidate_col is None:
-            continue
-
-        for row in table.find_all("tr")[1:]:
-            cells = row.find_all(["td", "th"])
-            if len(cells) <= candidate_col:
-                continue
-
-            cell = cells[candidate_col]
-            raw_name = cell.get_text(strip=True)
-            if not raw_name or len(raw_name) < 2:
-                continue
-
-            # Incumbent marker "(I)" or "(i)" at end of name
-            is_incumbent = bool(re.search(r"\(i\)", raw_name, re.IGNORECASE))
-            name = re.sub(r"\s*\([Ii]\)\s*$", "", raw_name).strip()
-            name = re.sub(r"\s*\*+\s*$", "", name).strip()
-
-            if not name or name.lower() in seen_names:
-                continue
-            seen_names.add(name.lower())
-
-            # Ballotpedia profile link
-            link_tag = cell.find("a", href=True)
-            bp_url = (
-                f"{BP_BASE}{link_tag['href']}"
-                if link_tag and link_tag["href"].startswith("/")
-                else (link_tag["href"] if link_tag else None)
-            )
-
-            party = ""
-            if party_col is not None and len(cells) > party_col:
-                party = cells[party_col].get_text(strip=True)
-
-            candidates.append({
-                "name":         name,
-                "party":        _normalise_party(party),
-                "is_incumbent": is_incumbent,
-                "bp_url":       bp_url,
-            })
-
-    # Format 2: candidate cards / divs with class containing "candidate"
-    if not candidates:
-        for div in soup.find_all(class_=re.compile(r"candidate", re.IGNORECASE)):
-            name_el = div.find(class_=re.compile(r"name", re.IGNORECASE)) or div.find("a")
-            if not name_el:
-                continue
-            name = name_el.get_text(strip=True)
-            if not name or name.lower() in seen_names:
-                continue
-            seen_names.add(name.lower())
-
-            is_incumbent = "incumbent" in div.get_text(strip=True).lower()
-            party_el = div.find(class_=re.compile(r"party", re.IGNORECASE))
-            party = party_el.get_text(strip=True) if party_el else ""
-
-            link_tag = name_el if name_el.name == "a" else name_el.find("a")
-            bp_url = (
-                f"{BP_BASE}{link_tag['href']}"
-                if link_tag and link_tag.get("href", "").startswith("/")
-                else None
-            )
-
-            candidates.append({
-                "name":         name,
-                "party":        _normalise_party(party),
-                "is_incumbent": is_incumbent,
-                "bp_url":       bp_url,
-            })
-
-    # Short page description (first non-empty paragraph in content)
-    description = None
-    content_div = _bp_content(soup)
-    for p in content_div.find_all("p"):
-        txt = p.get_text(strip=True)
-        if len(txt) > 40:
-            description = txt[:400]
-            break
-
-    log.info(
-        "  Race: %-55s  candidates: %d",
-        (office_name or url)[:55],
-        len(candidates),
-    )
-    return {
-        "office_name":   office_name,
-        "candidates":    candidates,
-        "election_date": election_date,
-        "description":   description,
-    }
+    log.info("Ballotpedia: %d total races collected", len(all_races))
+    return all_races
 
 
 def fetch_bp_candidate_positions(bp_url: str, session: requests.Session) -> list[dict]:
@@ -802,24 +910,17 @@ def main() -> None:
     session = make_session()
 
     # ── Phase 1: Collect races from Ballotpedia ────────────────────────────────
-    race_links = fetch_bp_wa_race_urls(session)
+    races = fetch_bp_wa_races(session)
 
     e_inserted = c_inserted = p_inserted = 0
 
-    for race_link in race_links:
+    for race in races:
         now = ts()
-        race_url  = race_link["url"]
-        race_name = race_link["name"]
-
-        detail = fetch_bp_race_detail(race_url, session)
-        if not detail:
-            log.warning("[%s] Skipping (no detail): %s", now, race_name)
-            continue
-
-        office_name   = detail.get("office_name") or race_name
-        election_date = detail.get("election_date", ELECTION_DATE_GENERAL)
-        description   = detail.get("description")
-        candidates    = detail.get("candidates", [])
+        office_name   = (race.get("office_name") or "").strip()
+        election_date = race.get("election_date") or ELECTION_DATE_GENERAL
+        description   = race.get("description")
+        candidates    = race.get("candidates") or []
+        source_url    = race.get("source_url")
 
         if not office_name:
             continue
@@ -831,7 +932,6 @@ def main() -> None:
         if county_name:
             county_id = county_map.get(county_name)
             if not county_id:
-                # Try bare name lookup (strip " County" suffix if present)
                 bare = county_name.replace(" County", "").strip()
                 county_id = county_map.get(bare)
             if not county_id:
@@ -843,13 +943,16 @@ def main() -> None:
             if not municipality_id:
                 log.warning("Municipality not found in DB: %r", city_name)
 
-        # Upsert election
+        # Track whether this is a new insert
+        ekey = (office_name, election_date, county_id, municipality_id)
+        is_new_election = ekey not in existing_elecs
+
         election_id = upsert_election(
             supabase, wa_id, office_name, level, election_date,
-            county_id, municipality_id, race_url, description,
+            county_id, municipality_id, source_url, description,
             existing_elecs, now,
         )
-        if election_id and election_id not in {v for v in existing_elecs.values() if v != election_id}:
+        if election_id and is_new_election:
             e_inserted += 1
 
         if not election_id:
@@ -869,7 +972,6 @@ def main() -> None:
             if cand_id:
                 c_inserted += 1
 
-            # Phase 3: scrape positions from candidate's own Ballotpedia page
             bp_url = cand.get("bp_url")
             if not bp_url or not cand_id:
                 continue
