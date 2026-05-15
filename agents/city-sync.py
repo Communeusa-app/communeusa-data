@@ -385,19 +385,23 @@ def main() -> None:
     for muni in municipalities:
         city_name   = clean(muni.get("CityName")) or "Unknown"
         city_id     = muni.get("CityID")
-        mrsc_county = strip_county_suffix(clean(muni.get("County")) or "")
+        # MRSC lists some cities that span county lines as "King/Snohomish" or
+        # "Douglas/ Grant/ Okanogan". Split on "/" and use the first county
+        # that exists in our DB so these cities are not silently skipped.
+        raw_county = clean(muni.get("County")) or ""
+        county_candidates = [strip_county_suffix(c.strip()) for c in raw_county.split("/")]
 
         if not city_id:
             log.warning("Skipping row with no CityID: %s", muni)
             cities_skipped += 1
             continue
 
-        county_id = county_map.get(mrsc_county)
+        county_id = next((county_map[c] for c in county_candidates if c in county_map), None)
         if not county_id:
-            skipped_counties.add(mrsc_county)
+            skipped_counties.add(raw_county)
             log.warning(
                 "County %r not found in DB — skipping %s (cityID=%s)",
-                mrsc_county, city_name, city_id,
+                raw_county, city_name, city_id,
             )
             cities_skipped += 1
             continue
