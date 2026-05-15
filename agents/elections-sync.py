@@ -283,7 +283,10 @@ def _parse_partisan_table(soup: BeautifulSoup, category_url: str) -> list[dict]:
 
                 for raw_text, bp_url in raw_entries:
                     name, cand_party, is_incumbent = _parse_name_party_incumbent(raw_text)
-                    if not name or name.lower() in seen_names:
+                    if not name or len(name) < 2 or name.lower() in seen_names:
+                        continue
+                    # Skip citation markers ([1]), district numbers, vote counts
+                    if re.match(r'^[\d\s\[\].,\-()²-¹]+$', name):
                         continue
                     seen_names.add(name.lower())
 
@@ -329,6 +332,9 @@ def _parse_results_table_candidates(soup: BeautifulSoup) -> list[dict]:
                 if not name or len(name) < 2 or name.lower() in seen_names:
                     continue
                 if name.lower() in skip:
+                    continue
+                # Skip vote counts, percentages, and citation markers
+                if re.match(r'^[\d\s,.()\[\]\-/%]+$', name):
                     continue
                 seen_names.add(name.lower())
                 link = cell.find("a", href=True)
