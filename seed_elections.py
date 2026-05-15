@@ -100,16 +100,33 @@ def build_official_lookup(supabase: Client) -> dict[str, Optional[str]]:
 
 
 def load_existing_elections(supabase: Client) -> set[tuple]:
-    """Return (office_name, election_date, municipality_level_raw) for existing rows."""
+    """Return (office_name, election_date, county_id, municipality_id) for existing rows.
+
+    Including county_id and municipality_id prevents false-positive deduplication
+    of same-named races in different jurisdictions (e.g. "City Council — Multiple
+    Positions" for Renton vs Bellingham on the same date).
+    """
     res = (
         supabase.table("elections")
-        .select("office_name,election_date,description")
+        .select("office_name,election_date,county_id,municipality_id")
         .execute()
     )
-    # We store municipality_level_raw in description? No — we use office_name+date+level
-    # Use (office_name, election_date) as the practical dedup key
     return {
-        (r["office_name"], r.get("election_date"))
+        (
+            r["office_name"],
+            r.get("election_date"),
+            r.get("county_id"),
+            r.get("municipality_id"),
+        )
+        for r in (res.data or [])
+    }
+
+
+def load_existing_candidates(supabase: Client) -> set[tuple]:
+    """Return (election_id, lowercase_name) for all existing candidates."""
+    res = supabase.table("candidates").select("election_id,name").execute()
+    return {
+        (r["election_id"], (r["name"] or "").lower())
         for r in (res.data or [])
     }
 
@@ -177,28 +194,40 @@ def main() -> None:
     e_inserted = e_skipped = 0
 
     for election in elections_data:
-        election_key = election["_key"]
-        office_name  = election["office_name"]
+        election_key  = election["_key"]
+        office_name   = election["office_name"]
         election_date = election.get("election_date")
 
-        # Skip if already in DB (matched by office_name + election_date)
-        if (office_name, election_date) in existing_elections:
+        # Resolve location first — needed for the 4-part dedup key.
+        county_id, municipality_id = resolve_location(election, county_map, municipality_map)
+
+        # Skip if already in DB using (office_name, date, county_id, municipality_id).
+        # A 2-field key (office_name, date) caused same-named races in different
+        # jurisdictions (e.g. Renton/Bellingham "City Council — Multiple Positions"
+        # on the same date) to be incorrectly deduplicated.
+        skip_key = (office_name, election_date, county_id, municipality_id)
+        if skip_key in existing_elections:
             log.info("SKIP  election already exists: %s (%s)", office_name, election_date)
-            # Still need the DB id for candidate insertion
-            res = (
+            # Still need the DB id for candidate insertion.
+            q = (
                 supabase.table("elections")
                 .select("id")
                 .eq("office_name", office_name)
                 .eq("election_date", election_date)
-                .limit(1)
-                .execute()
             )
+            if county_id:
+                q = q.eq("county_id", county_id)
+            else:
+                q = q.is_("county_id", "null")
+            if municipality_id:
+                q = q.eq("municipality_id", municipality_id)
+            else:
+                q = q.is_("municipality_id", "null")
+            res = q.limit(1).execute()
             if res.data:
                 key_to_db_id[election_key] = res.data[0]["id"]
             e_skipped += 1
             continue
-
-        county_id, municipality_id = resolve_location(election, county_map, municipality_map)
 
         payload = {
             "state_id":        wa_id,
@@ -220,13 +249,14 @@ def main() -> None:
 
         db_id = res.data[0]["id"]
         key_to_db_id[election_key] = db_id
-        existing_elections.add((office_name, election_date))
+        existing_elections.add(skip_key)
         log.info("INSERT election [%s] %s (%s)", election["level"], office_name, election_date)
         e_inserted += 1
 
     log.info("Elections: %d inserted, %d skipped (already existed)", e_inserted, e_skipped)
 
     # ── Insert candidates ──────────────────────────────────────────────────────
+    existing_candidates = load_existing_candidates(supabase)
     c_inserted = c_skipped = c_linked = 0
 
     for candidate in candidates_data:
@@ -239,11 +269,16 @@ def main() -> None:
             c_skipped += 1
             continue
 
+        cand_key = (election_id, (candidate.get("name") or "").lower())
+        if cand_key in existing_candidates:
+            log.info("SKIP  candidate already exists: %s → %s", candidate["name"], election_key[:50])
+            c_skipped += 1
+            continue
+
         # Try to link incumbents to their official profile
         official_id: Optional[str] = None
         if candidate.get("is_incumbent"):
             name_key = (candidate.get("name") or "").lower()
-            # Try full name first, then just the first token (last name only from FEC data)
             official_id = official_lookup.get(name_key)
             if official_id:
                 c_linked += 1
@@ -262,6 +297,7 @@ def main() -> None:
         }
 
         supabase.table("candidates").insert(payload).execute()
+        existing_candidates.add(cand_key)
         log.info("INSERT candidate %s%s → %s",
                  candidate["name"],
                  " (inc)" if candidate.get("is_incumbent") else "",
