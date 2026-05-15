@@ -32,6 +32,7 @@ Run:
     python3 agents/elections-sync.py
 """
 
+import json
 import logging
 import os
 import re
@@ -70,6 +71,11 @@ ELECTION_DATE_PRIMARY = "2026-08-04"
 FILING_DEADLINE       = "2026-05-22"   # typical WA filing deadline
 
 WA_FIPS = "53"
+
+RETRY_ATTEMPTS = 3
+RETRY_DELAY    = 2.0   # seconds between retries on Supabase insert failure
+
+PROGRESS_FILE  = Path(__file__).parent.parent / "output" / "elections-sync-progress.json"
 
 WA_COUNTIES = {
     "Adams", "Asotin", "Benton", "Chelan", "Clallam", "Clark", "Columbia",
@@ -756,6 +762,60 @@ def load_existing_positions(supabase: Client) -> set[tuple]:
     }
 
 
+# ── Supabase retry wrapper ─────────────────────────────────────────────────────
+
+def _sb_insert(table_ref, payload: dict) -> Optional[object]:
+    """
+    Execute a Supabase insert, retrying up to RETRY_ATTEMPTS times on any
+    exception or empty-data response (both indicate transient failures).
+    Returns the response object on success, None if all attempts fail.
+    """
+    for attempt in range(RETRY_ATTEMPTS):
+        try:
+            res = table_ref.insert(payload).execute()
+            if res.data:
+                return res
+            # Empty data without an exception is also a transient failure
+            if attempt < RETRY_ATTEMPTS - 1:
+                log.warning(
+                    "INSERT returned no data (attempt %d/%d) — retrying in %.0fs",
+                    attempt + 1, RETRY_ATTEMPTS, RETRY_DELAY,
+                )
+                time.sleep(RETRY_DELAY)
+        except Exception as exc:
+            if attempt < RETRY_ATTEMPTS - 1:
+                log.warning(
+                    "INSERT error (attempt %d/%d): %s — retrying in %.0fs",
+                    attempt + 1, RETRY_ATTEMPTS, exc, RETRY_DELAY,
+                )
+                time.sleep(RETRY_DELAY)
+            else:
+                log.error("INSERT failed after %d attempts: %s", RETRY_ATTEMPTS, exc)
+    return None
+
+
+# ── Progress checkpoint ────────────────────────────────────────────────────────
+
+def load_progress() -> set[str]:
+    """Return set of election IDs that have been fully processed (all candidates done)."""
+    if not PROGRESS_FILE.exists():
+        return set()
+    try:
+        data = json.loads(PROGRESS_FILE.read_text())
+        return set(data.get("completed_election_ids", []))
+    except Exception as exc:
+        log.warning("Could not read progress file %s: %s — starting fresh", PROGRESS_FILE, exc)
+        return set()
+
+
+def save_progress(completed_ids: set[str]) -> None:
+    """Persist the set of completed election IDs to PROGRESS_FILE."""
+    PROGRESS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    PROGRESS_FILE.write_text(
+        json.dumps({"completed_election_ids": sorted(completed_ids)}, indent=2)
+    )
+
+
 # ── Core sync ──────────────────────────────────────────────────────────────────
 
 def upsert_election(
@@ -794,8 +854,8 @@ def upsert_election(
         "description":     description,
         "source_url":      source_url,
     }
-    res = supabase.table("elections").insert(payload).execute()
-    if not res.data:
+    res = _sb_insert(supabase.table("elections"), payload)
+    if not res:
         log.error("[%s] INSERT election failed: %s", now, office_name)
         return None
 
@@ -838,8 +898,8 @@ def upsert_candidate(
         "website":        None,
         "ballotpedia_url": bp_url,
     }
-    res = supabase.table("candidates").insert(payload).execute()
-    if not res.data:
+    res = _sb_insert(supabase.table("candidates"), payload)
+    if not res:
         log.error("[%s] INSERT candidate failed: %s", now, name)
         return None
 
@@ -874,9 +934,9 @@ def upsert_positions(
             "position_statement": pos.get("position_statement"),
             "source_url":         pos.get("source_url"),
         }
-        supabase.table("candidate_positions").insert(payload).execute()
-        existing.add(key)
-        inserted += 1
+        if _sb_insert(supabase.table("candidate_positions"), payload):
+            existing.add(key)
+            inserted += 1
     if inserted:
         log.info("[%s]     Inserted %d position(s)", now, inserted)
     return inserted
@@ -891,6 +951,13 @@ def main() -> None:
         sys.exit("ERROR: SUPABASE_URL and SUPABASE_SERVICE_KEY must be set in .env")
 
     log.info("=== elections-sync starting ===")
+
+    completed_election_ids = load_progress()
+    if completed_election_ids:
+        log.info(
+            "Resuming from checkpoint — %d elections already fully processed",
+            len(completed_election_ids),
+        )
 
     supabase: Client = create_client(supabase_url, supabase_key)
     wa_id            = get_wa_state_id(supabase)
@@ -958,6 +1025,11 @@ def main() -> None:
         if not election_id:
             continue
 
+        # Skip elections already fully processed in a prior run
+        if election_id in completed_election_ids:
+            log.debug("SKIP (checkpoint): %s", office_name)
+            continue
+
         # Upsert candidates
         for cand in candidates:
             name = (cand.get("name") or "").strip()
@@ -980,6 +1052,10 @@ def main() -> None:
             if positions:
                 p_inserted += upsert_positions(supabase, cand_id, positions, existing_pos, now)
 
+        # Mark this election as fully processed and persist the checkpoint
+        completed_election_ids.add(election_id)
+        save_progress(completed_election_ids)
+
     # ── Phase 2: Supplement with WA SoS results API ───────────────────────────
     sos_races = fetch_sos_contests(session)
     now = ts()
@@ -998,6 +1074,9 @@ def main() -> None:
             race.get("source_url"), None, existing_elecs, now,
         )
         if eid:
+            if eid not in completed_election_ids:
+                completed_election_ids.add(eid)
+                save_progress(completed_election_ids)
             e_inserted += 1
 
     log.info(
