@@ -39,7 +39,7 @@ import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Union
 from urllib.parse import urljoin
 
 import requests
@@ -127,7 +127,7 @@ def get_html(url: str, session: requests.Session, *, delay: bool = True) -> Opti
         return None
 
 
-def get_json(url: str, session: requests.Session, *, delay: bool = True) -> Optional[dict | list]:
+def get_json(url: str, session: requests.Session, *, delay: bool = True) -> Optional[Union[dict, list]]:
     """Fetch URL and return parsed JSON, or None on failure."""
     if delay:
         time.sleep(REQUEST_DELAY)
