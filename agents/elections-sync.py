@@ -578,10 +578,11 @@ def _fetch_category_races(category_url: str, session: requests.Session) -> list[
         ):
             continue
         # Skip category overview pages — only follow individual race pages.
-        # Category pages use plural '_elections,_YEAR'; individual race pages use singular '_election,_YEAR'.
+        # Individual race pages use singular '_election,_YEAR'; category pages use
+        # plural '_elections' (in any position in the URL).
         hl = href.lower()
         if (
-            re.search(r"_elections,_\d{4}", hl)   # plural: category pages like _elections,_2026
+            re.search(r"_elections[,_]", hl)       # any plural "elections" — category page
             or "_ballot_measures" in hl
             or "_local_election_coverage" in hl
             or "municipal_elections" in hl
