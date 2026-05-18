@@ -3,11 +3,8 @@ CommuneUSA Campaign Finance Sync Agent
 
 Data sources:
   PDC  — WA Public Disclosure Commission (data.wa.gov)
-         Itemized contributions to WA candidates across all jurisdiction types:
-           Legislative — state House and Senate races
-           Local       — city council, mayor, and other local races
-           Statewide   — governor, AG, secretary of state, and other statewide offices
-           Judicial    — judges and court races
+         Itemized contributions to ALL WA candidates (no jurisdiction_type filter),
+         covering Legislative, Local, Statewide, and Judicial races in one pass.
          Free API, no key required. 1 000 records per page.
 
   FEC  — Federal Election Commission (api.fec.gov)
@@ -16,8 +13,8 @@ Data sources:
 
 Flow:
   1. Build name lookup (officials table → lowercase name → id).
-  2. For each PDC jurisdiction type × election year (2023–2026), page through
-     contributions and match filer names to officials.
+  2. For each election year (2023–2026), page through all PDC contributions
+     and match filer names to officials.
   3. Fetch WA federal candidates from FEC; for each, pull Schedule A.
   4. Load existing (official_id, donor_name, amount, donation_date) keys.
   5. Insert new rows into campaign_finance, skipping duplicates.
@@ -68,9 +65,8 @@ FEC_DELAY         = 0.5    # seconds between FEC requests
 
 # Election cycles to pull. PDC uses individual years; FEC uses 2-year periods.
 # 2023 is included because many WA local races (city council, mayor) are odd-year.
-PDC_YEARS             = ("2023", "2024", "2025", "2026")
-PDC_JURISDICTION_TYPES = ("Legislative", "Local", "Statewide", "Judicial")
-FEC_CYCLES            = (2024, 2026)
+PDC_YEARS  = ("2023", "2024", "2025", "2026")
+FEC_CYCLES = (2024, 2026)
 
 BATCH_SIZE        = 200    # rows per Supabase insert
 
@@ -205,39 +201,35 @@ def batch_insert(supabase: Client, rows: list[dict], source: str) -> int:
 def fetch_pdc_contributions(
     name_lookup: dict[str, Optional[str]],
     existing: set[tuple],
-    jurisdiction_type: str,
 ) -> list[dict]:
     """
-    Page through PDC contributions for a single jurisdiction_type across all
-    PDC_YEARS. Returns new rows not already in `existing`; mutates `existing`
-    so subsequent calls for other jurisdiction types don't re-insert the same
-    records.
+    Page through ALL PDC candidate contributions across all PDC_YEARS (no
+    jurisdiction_type filter). Returns new rows not already in `existing`;
+    mutates `existing` to prevent re-inserting across years.
     """
     rows: list[dict] = []
     unmatched: set[str] = set()
-    tag = f"PDC/{jurisdiction_type}"
 
     for year in PDC_YEARS:
         offset = 0
         page_num = 0
-        log.info("[%s] fetching election_year=%s …", tag, year)
+        log.info("[PDC] fetching election_year=%s …", year)
 
         while True:
             params = {
-                "$limit":             PDC_PAGE_SIZE,
-                "$offset":            offset,
-                "type":               "Candidate",
-                "jurisdiction_type":  jurisdiction_type,
-                "election_year":      year,
-                "$order":             "id ASC",
+                "$limit":    PDC_PAGE_SIZE,
+                "$offset":   offset,
+                "type":      "Candidate",
+                "election_year": year,
+                "$order":    "id ASC",
             }
             try:
                 resp = requests.get(PDC_BASE, params=params, timeout=30)
                 resp.raise_for_status()
                 page = resp.json()
             except Exception as exc:
-                log.error("[%s] request failed (year=%s offset=%d): %s",
-                          tag, year, offset, exc)
+                log.error("[PDC] request failed (year=%s offset=%d): %s",
+                          year, offset, exc)
                 break
 
             if not page:
@@ -288,8 +280,8 @@ def fetch_pdc_contributions(
                 existing.add(dedup_key)
                 matched_this_page += 1
 
-            log.info("[%s] year=%s page=%d  fetched=%d  new=%d  running_total=%d",
-                     tag, year, page_num, len(page), matched_this_page, len(rows))
+            log.info("[PDC] year=%s page=%d  fetched=%d  new=%d  running_total=%d",
+                     year, page_num, len(page), matched_this_page, len(rows))
 
             if len(page) < PDC_PAGE_SIZE:
                 break
@@ -297,12 +289,11 @@ def fetch_pdc_contributions(
             time.sleep(PDC_DELAY)
 
     if unmatched:
-        log.info("[%s] %d unmatched filer names (not in officials table)",
-                 tag, len(unmatched))
+        log.info("[PDC] %d unmatched filer names (not in officials table)", len(unmatched))
         for name in sorted(unmatched)[:20]:
-            log.debug("[%s] unmatched: %r", tag, name)
+            log.debug("[PDC] unmatched: %r", name)
 
-    log.info("[%s] collected %d new rows", tag, len(rows))
+    log.info("[PDC] collected %d new rows", len(rows))
     return rows
 
 
@@ -482,18 +473,10 @@ def main() -> None:
 
     existing = load_existing_keys(supabase)
 
-    # ── PDC — all jurisdiction types ──
-    pdc_counts: dict[str, int] = {}
-    pdc_total = 0
-    for jtype in PDC_JURISDICTION_TYPES:
-        rows = fetch_pdc_contributions(name_lookup, existing, jtype)
-        inserted = batch_insert(supabase, rows, f"PDC/{jtype}") if rows else 0
-        pdc_counts[jtype] = inserted
-        pdc_total += inserted
-        log.info("[PDC/%s] done — %d rows inserted", jtype, inserted)
-
-    log.info("[PDC] all types complete — %s — total: %d",
-             "  ".join(f"{k}: {v}" for k, v in pdc_counts.items()), pdc_total)
+    # ── PDC — all candidates, all jurisdiction types in one pass ──
+    pdc_rows = fetch_pdc_contributions(name_lookup, existing)
+    pdc_total = batch_insert(supabase, pdc_rows, "PDC") if pdc_rows else 0
+    log.info("[PDC] done — %d rows inserted", pdc_total)
 
     # ── FEC ──
     fec_inserted = 0
