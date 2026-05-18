@@ -94,6 +94,9 @@ STATE_KEYWORDS = {
     "insurance commissioner", "superintendent of public instruction",
     "state senate", "state house", "state representative", "state senator",
     "washington state", "supreme court justice", "court of appeals",
+    # WA legislative district races scraped from Ballotpedia
+    "house of representatives district", "legislative district",
+    "supreme court", "court of appeals",
 }
 
 # Keywords that identify federal-level races
@@ -205,10 +208,11 @@ def _normalise_party_abbrev(abbrev: str) -> Optional[str]:
 def _parse_name_party_incumbent(raw: str) -> tuple[str, Optional[str], bool]:
     """
     Parse strings like 'Jeff Holy(i)', 'Marie Gluesenkamp Pérez(D)', 'Bob(R)(i)'.
+    Also handles plain 'Incumbent' suffix (no parentheses) seen on some category pages.
     Returns (clean_name, party_or_None, is_incumbent).
     """
-    is_incumbent = bool(re.search(r"\(i\)", raw, re.IGNORECASE))
-    text = re.sub(r"\(i\)", "", raw, flags=re.IGNORECASE).strip()
+    is_incumbent = bool(re.search(r"\(i\)|\bIncumbent\b", raw, re.IGNORECASE))
+    text = re.sub(r"\(i\)|\bIncumbent\b", "", raw, flags=re.IGNORECASE).strip()
 
     party_match = re.search(r"\(([A-Za-z]+)\)\s*$", text)
     party = None
@@ -220,17 +224,42 @@ def _parse_name_party_incumbent(raw: str) -> tuple[str, Optional[str], bool]:
     return text, party, is_incumbent
 
 
+def _office_name_from_bp_url(bp_url: str, fallback: str) -> str:
+    """Derive a human-readable office name from a Ballotpedia URL slug."""
+    try:
+        from urllib.parse import unquote
+        slug = bp_url.rstrip("/").split("/")[-1].split(",")[0]
+        return unquote(slug).replace("_", " ")
+    except Exception:
+        return fallback
+
+
 def _parse_partisan_table(soup: BeautifulSoup, category_url: str) -> list[dict]:
     """
     Parse a Ballotpedia category page that uses candidateListTablePartisan.
     Each row is one district; columns are Office + one per party.
+
+    Some pages prepend a single merged title row before the real column header.
+    We skip any leading rows with only one cell to find the real header.
+
     Returns list of race dicts {office_name, candidates, election_date, source_url, description}.
     """
     races = []
     for table in soup.find_all("table", class_=re.compile(r"candidateListTable", re.IGNORECASE)):
-        header_row = table.find("tr")
-        if not header_row:
+        all_rows = table.find_all("tr")
+        if not all_rows:
             continue
+
+        # Find the real column-header row — the first row that has ≥ 2 cells.
+        # Merged title rows (e.g. "Washington State Senate primary 2026") have only 1 cell
+        # and cause column detection to fail.
+        header_idx = 0
+        for idx, row in enumerate(all_rows):
+            if len(row.find_all(["th", "td"])) >= 2:
+                header_idx = idx
+                break
+
+        header_row = all_rows[header_idx]
         headers = [th.get_text(strip=True) for th in header_row.find_all(["th", "td"])]
 
         col_office = 0
@@ -242,7 +271,7 @@ def _parse_partisan_table(soup: BeautifulSoup, category_url: str) -> list[dict]:
             elif h:
                 col_parties.append((i, h))
 
-        for row in table.find_all("tr")[1:]:
+        for row in all_rows[header_idx + 1:]:
             cells = row.find_all(["td", "th"])
             if len(cells) <= col_office:
                 continue
@@ -252,12 +281,20 @@ def _parse_partisan_table(soup: BeautifulSoup, category_url: str) -> list[dict]:
             if not office_text:
                 continue
 
+            # Accept both relative (/path) and absolute (https://ballotpedia.org/path) links.
             office_link = office_cell.find("a", href=True)
-            office_url = (
-                f"{BP_BASE}{office_link['href']}"
-                if office_link and office_link["href"].startswith("/")
-                else None
-            )
+            office_url: Optional[str] = None
+            if office_link:
+                href = office_link["href"]
+                if href.startswith("/"):
+                    office_url = f"{BP_BASE}{href}"
+                elif href.startswith("https://ballotpedia.org/"):
+                    office_url = href
+
+            # Build a better office_name from the URL slug when the cell only has
+            # a bare district number like "District 6".
+            if office_url and re.match(r"^District \d+$", office_text, re.IGNORECASE):
+                office_text = _office_name_from_bp_url(office_url, office_text)
 
             candidates: list[dict] = []
             seen_names: set[str] = set()
@@ -273,7 +310,11 @@ def _parse_partisan_table(soup: BeautifulSoup, category_url: str) -> list[dict]:
                     for link in links:
                         text = link.get_text(strip=True)
                         href = link["href"]
-                        bp_url = f"{BP_BASE}{href}" if href.startswith("/") else None
+                        bp_url: Optional[str] = None
+                        if href.startswith("/"):
+                            bp_url = f"{BP_BASE}{href}"
+                        elif href.startswith("https://ballotpedia.org/"):
+                            bp_url = href
                         if text:
                             raw_entries.append((text, bp_url))
                 else:
@@ -287,6 +328,12 @@ def _parse_partisan_table(soup: BeautifulSoup, category_url: str) -> list[dict]:
                         continue
                     # Skip citation markers ([1]), district numbers, vote counts
                     if re.match(r'^[\d\s\[\].,\-()²-¹]+$', name):
+                        continue
+                    # Skip cell text that looks like an office/district name, not a person
+                    if re.match(r'^(District|Position|Seat)\s+\d+', name, re.IGNORECASE):
+                        continue
+                    # Skip status messages that appear in cells before candidates file
+                    if re.search(r'\b(results? pending|no candidate|did not make|submit photo|write-in)\b', name, re.IGNORECASE):
                         continue
                     seen_names.add(name.lower())
 
@@ -322,6 +369,9 @@ def _parse_results_table_candidates(soup: BeautifulSoup) -> list[dict]:
     seen_names: set[str] = set()
     skip = {"candidate", "party", "votes", "pct", "%", "total", ""}
 
+    _noise = {"submit photo", "other/write-in votes", "write-in", "popular votes",
+              "popular vote", "candidate/running mate", "candidate"}
+
     for table in soup.find_all("table", class_=re.compile(r"results_table", re.IGNORECASE)):
         for row in table.find_all("tr"):
             for cell in row.find_all(["td", "th"]):
@@ -331,10 +381,13 @@ def _parse_results_table_candidates(soup: BeautifulSoup) -> list[dict]:
                 name, party, is_incumbent = _parse_name_party_incumbent(raw)
                 if not name or len(name) < 2 or name.lower() in seen_names:
                     continue
-                if name.lower() in skip:
+                if name.lower() in skip or name.lower() in _noise:
                     continue
                 # Skip vote counts, percentages, and citation markers
                 if re.match(r'^[\d\s,.()\[\]\-/%]+$', name):
+                    continue
+                # Skip status messages
+                if re.search(r'\b(results? pending|no candidate|did not make)\b', name, re.IGNORECASE):
                     continue
                 seen_names.add(name.lower())
                 link = cell.find("a", href=True)
@@ -389,10 +442,16 @@ def _fetch_individual_race(url: str, session: requests.Session) -> Optional[dict
                 raw = cell.get_text(strip=True)
                 if not raw or len(raw) < 2:
                     continue
-                is_inc = bool(re.search(r"\(i\)", raw, re.IGNORECASE))
-                name = re.sub(r"\s*\([Ii]\)\s*$", "", raw).strip()
+                is_inc = bool(re.search(r"\(i\)|\bIncumbent\b", raw, re.IGNORECASE))
+                name = re.sub(r"\(i\)|\bIncumbent\b", "", raw, flags=re.IGNORECASE).strip()
                 name = re.sub(r"\s*\*+\s*$", "", name).strip()
                 if not name or name.lower() in seen_names:
+                    continue
+                _noise_set = {"submit photo", "other/write-in votes", "write-in",
+                              "popular votes", "popular vote", "candidate/running mate"}
+                if name.lower() in _noise_set:
+                    continue
+                if re.search(r'\b(results? pending|no candidate|did not make)\b', name, re.IGNORECASE):
                     continue
                 seen_names.add(name.lower())
                 link = cell.find("a", href=True)
@@ -411,6 +470,14 @@ def _fetch_individual_race(url: str, session: requests.Session) -> Optional[dict
                     "bp_url":       bp_url,
                 })
 
+    # Last resort: some individual district pages use candidateListTablePartisan
+    # with a single data row.  _parse_partisan_table handles the single-row case.
+    if not candidates:
+        for r in _parse_partisan_table(soup, url):
+            for c in r.get("candidates", []):
+                if c["name"].lower() not in {x["name"].lower() for x in candidates}:
+                    candidates.append(c)
+
     description = None
     for p in _bp_content(soup).find_all("p"):
         txt = p.get_text(strip=True)
@@ -428,11 +495,49 @@ def _fetch_individual_race(url: str, session: requests.Session) -> Optional[dict
     }
 
 
+def _extract_district_urls(soup: BeautifulSoup) -> list[str]:
+    """
+    Extract individual race page URLs from a candidateListTablePartisan category page.
+    Each row's first column links to the specific district race page.
+    Only returns links whose URL path contains 'washington' (case-insensitive).
+    """
+    urls: list[str] = []
+    seen: set[str] = set()
+    for table in soup.find_all("table", class_=re.compile(r"candidateListTable", re.IGNORECASE)):
+        for row in table.find_all("tr")[1:]:   # skip header row
+            cells = row.find_all(["td", "th"])
+            if not cells:
+                continue
+            link = cells[0].find("a", href=True)
+            if not link:
+                continue
+            href = link["href"]
+            # Accept both relative (/path) and absolute (https://ballotpedia.org/path) links.
+            if href.startswith("https://ballotpedia.org/"):
+                href = href[len("https://ballotpedia.org"):]  # normalise to relative
+            if (
+                href.startswith("/")
+                and ":" not in href
+                and "washington" in href.lower()
+                and href not in seen
+            ):
+                seen.add(href)
+                urls.append(f"{BP_BASE}{href}")
+    return urls
+
+
 def _fetch_category_races(category_url: str, session: requests.Session) -> list[dict]:
     """
     Fetch one Ballotpedia category page and return all races found.
-    If the page has a candidateListTablePartisan, parse it directly.
-    Otherwise follow individual race links.
+
+    For WA Senate/House category pages the partisan summary table only holds
+    abbreviated data (district numbers as office names).  We prefer to follow
+    each individual district link so _fetch_individual_race can produce a
+    proper office name and full candidate list.  Fall back to parsing the table
+    directly only if no per-district links are found.
+
+    For pages without a partisan table, collect individual race links that
+    contain 'washington' in the URL path.
     """
     soup = get_html(category_url, session)
     if not soup:
@@ -442,17 +547,45 @@ def _fetch_category_races(category_url: str, session: requests.Session) -> list[
     label = category_url.split("/")[-1]
 
     if soup.find("table", class_=re.compile(r"candidateListTable", re.IGNORECASE)):
+        district_urls = _extract_district_urls(soup)
+        if district_urls:
+            log.info("  Category %-50s  district links → %d", label[:50], len(district_urls))
+            races = []
+            for dist_url in district_urls:
+                detail = _fetch_individual_race(dist_url, session)
+                if detail:
+                    races.append(detail)
+            return races
+        # No individual links — fall back to reading the table summary
         races = _parse_partisan_table(soup, category_url)
-        log.info("  Category %-50s  partisan table → %d races", label[:50], len(races))
+        log.info("  Category %-50s  partisan table fallback → %d races", label[:50], len(races))
         return races
 
-    # Fall back to individual race links
+    # No partisan table — collect individual race links from the page.
+    # Restrict to links whose path contains 'washington' so we never follow
+    # links to other-state races that may appear on national category pages.
+    # Skip anchor fragments and known category-level URL patterns.
     content = _bp_content(soup)
     seen: set[str] = set()
     race_links: list[tuple[str, str]] = []
     for a in content.find_all("a", href=True):
-        href = a["href"]
-        if not href.startswith("/") or ":" in href or "2026" not in href:
+        href = a["href"].split("#")[0]  # strip anchor fragment
+        if (
+            not href.startswith("/")
+            or ":" in href
+            or "2026" not in href
+            or "washington" not in href.lower()
+        ):
+            continue
+        # Skip category overview pages — only follow individual race pages.
+        # Category pages use plural '_elections,_YEAR'; individual race pages use singular '_election,_YEAR'.
+        hl = href.lower()
+        if (
+            re.search(r"_elections,_\d{4}", hl)   # plural: category pages like _elections,_2026
+            or "_ballot_measures" in hl
+            or "_local_election_coverage" in hl
+            or "municipal_elections" in hl
+        ):
             continue
         if href in seen:
             continue
@@ -474,8 +607,10 @@ def _fetch_category_races(category_url: str, session: requests.Session) -> list[
 def fetch_bp_wa_races(session: requests.Session) -> list[dict]:
     """
     Orchestrate WA 2026 race collection from Ballotpedia.
-    1. Fetch overview page → extract marqueetable category links.
-    2. For each category page, delegate to _fetch_category_races().
+    1. Fetch the WA 2026 overview page → extract marqueetable category links.
+       Only keep links whose URL path contains 'washington' to prevent following
+       national category pages (e.g. /United_States_Senate_elections,_2026).
+    2. For each category page delegate to _fetch_category_races().
     Returns list of race dicts {office_name, candidates, election_date, source_url, description}.
     """
     soup = get_html(BP_WA_2026, session, delay=False)
@@ -495,11 +630,17 @@ def fetch_bp_wa_races(session: requests.Session) -> list[dict]:
     source = marquee if marquee else content
     for a in source.find_all("a", href=True):
         href = a["href"]
-        if href.startswith("/") and ":" not in href and href not in seen:
-            seen.add(href)
-            category_urls.append(f"{BP_BASE}{href}")
+        if (
+            not href.startswith("/")
+            or ":" in href
+            or "washington" not in href.lower()   # ← only WA-relevant pages
+            or href in seen
+        ):
+            continue
+        seen.add(href)
+        category_urls.append(f"{BP_BASE}{href}")
 
-    log.info("Ballotpedia overview: %d category links", len(category_urls))
+    log.info("Ballotpedia overview: %d WA category links", len(category_urls))
 
     all_races: list[dict] = []
     for cat_url in category_urls:
