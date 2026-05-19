@@ -113,10 +113,11 @@ def resolve_county(raw: Optional[str], county_map: dict[str, str]) -> Optional[s
     return cid
 
 
-def load_existing_names(supabase: Client, table: str, wa_id: str) -> set[str]:
-    """Return {lowercase name} for all rows in table belonging to WA."""
-    res = supabase.table(table).select("name").eq("state_id", wa_id).execute()
-    return {(r["name"] or "").lower() for r in (res.data or [])}
+def load_existing_names(supabase: Client, table: str, wa_id: str,
+                        col: str = "name") -> set[str]:
+    """Return {lowercase value of col} for all rows in table belonging to WA."""
+    res = supabase.table(table).select(col).eq("state_id", wa_id).execute()
+    return {(r[col] or "").lower() for r in (res.data or [])}
 
 
 # ── 1. School districts & board members ───────────────────────────────────────
@@ -395,7 +396,7 @@ def seed_judiciary(supabase: Client, wa_id: str, county_map: dict[str, str],
     if not records:
         return
 
-    existing = load_existing_names(supabase, "judiciary", wa_id)
+    existing = load_existing_names(supabase, "judiciary", wa_id, col="judge_name")
     new_rows: list[dict] = []
     skipped = 0
 
