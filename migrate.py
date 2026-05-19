@@ -512,6 +512,175 @@ def extract_elections(wb):
     return elections, candidates
 
 
+def _map_records(raw: list[dict], col_map: dict[str, str], required_key: str) -> list[dict]:
+    """Map raw extracted records through col_map; skip rows missing required_key."""
+    out = []
+    for rec in raw:
+        val = rec.get(required_key)
+        if not val or not str(val).strip():
+            continue
+        out.append({target: rec.get(src) for src, target in col_map.items()})
+    return out
+
+
+def extract_school_boards(wb) -> list[dict]:
+    ws = find_sheet(wb, "School Boards")
+    if ws is None:
+        print("  WARN  sheet not found: School Boards")
+        return []
+    raw = extract_records(ws)
+    col_map = {
+        "district_name":     "district_name",
+        "county":            "county",
+        "board_director_name": "director_name",
+        "position_director": "position",
+        "party_affiliation": "party_affiliation",
+        "term_start":        "term_start",
+        "term_end":          "term_end",
+        "phone_email":       "phone",
+        "official_website":  "website",
+    }
+    records = _map_records(raw, col_map, "board_director_name")
+    print(f"  OK    School Boards → school_boards.json ({len(records)} records)")
+    return records
+
+
+def extract_state_agencies(wb) -> list[dict]:
+    ws = find_sheet(wb, "State Agencies")
+    if ws is None:
+        print("  WARN  sheet not found: State Agencies")
+        return []
+    raw = extract_records(ws)
+    col_map = {
+        "category":          "category",
+        "agency_department": "name",
+        "abbreviation":      "abbreviation",
+        "director_secretary": "director_name",
+        "selection":         "selection_method",
+        "budget_approx":     "budget",
+        "employees":         "employees",
+        "headquarters":      "headquarters",
+        "phone":             "phone",
+        "website":           "website",
+        "mission_summary":   "mission_summary",
+    }
+    records = _map_records(raw, col_map, "agency_department")
+    print(f"  OK    State Agencies → state_agencies.json ({len(records)} records)")
+    return records
+
+
+def extract_law_enforcement(wb) -> list[dict]:
+    ws = find_sheet(wb, "Law Enforcement")
+    if ws is None:
+        print("  WARN  sheet not found: Law Enforcement")
+        return []
+    raw = extract_records(ws)
+    col_map = {
+        "agency_type":          "agency_type",
+        "agency_name":          "name",
+        "jurisdiction_coverage": "jurisdiction",
+        "chief_sheriff":        "chief_name",
+        "sworn_officers":       "sworn_officers",
+        "headquarters_address": "headquarters",
+        "phone":                "phone",
+        "website":              "website",
+    }
+    records = _map_records(raw, col_map, "agency_name")
+    print(f"  OK    Law Enforcement → law_enforcement.json ({len(records)} records)")
+    return records
+
+
+def extract_fire_ems(wb) -> list[dict]:
+    ws = find_sheet(wb, "Fire")
+    if ws is None:
+        print("  WARN  sheet not found: Fire & EMS")
+        return []
+    raw = extract_records(ws)
+    col_map = {
+        "agency_type":              "agency_type",
+        "department_authority_name": "name",
+        "jurisdiction_area":        "jurisdiction",
+        "fire_chief":               "chief_name",
+        "stations":                 "stations",
+        "personnel":                "personnel",
+        "headquarters":             "headquarters",
+        "phone":                    "phone",
+        "website":                  "website",
+        "service_type":             "service_type",
+    }
+    records = _map_records(raw, col_map, "department_authority_name")
+    print(f"  OK    Fire & EMS → fire_ems.json ({len(records)} records)")
+    return records
+
+
+def extract_hospitals(wb) -> list[dict]:
+    ws = find_sheet(wb, "Hospital")
+    if ws is None:
+        print("  WARN  sheet not found: Hospitals & Healthcare")
+        return []
+    raw = extract_records(ws)
+    col_map = {
+        "ownership_type":       "ownership_type",
+        "hospital_facility_name": "name",
+        "county":               "county",
+        "city":                 "city",
+        "beds":                 "beds",
+        "trauma_level":         "trauma_level",
+        "health_system":        "health_system",
+        "ceo_administrator":    "ceo",
+        "phone":                "phone",
+        "website":              "website",
+    }
+    records = _map_records(raw, col_map, "hospital_facility_name")
+    print(f"  OK    Hospitals & Healthcare → hospitals.json ({len(records)} records)")
+    return records
+
+
+def extract_utilities_transit(wb) -> list[dict]:
+    ws = find_sheet(wb, "Utilities")
+    if ws is None:
+        print("  WARN  sheet not found: Utilities & Transit")
+        return []
+    raw = extract_records(ws)
+    col_map = {
+        "category":              "category",
+        "agency_district_name":  "name",
+        "county_region":         "county_region",
+        "service_type":          "service_type",
+        "customers_riders":      "customers_riders",
+        "ceo_executive_director": "ceo",
+        "phone":                 "phone",
+        "website":               "website",
+        "governing_board":       "governing_board",
+    }
+    records = _map_records(raw, col_map, "agency_district_name")
+    print(f"  OK    Utilities & Transit → utilities_transit.json ({len(records)} records)")
+    return records
+
+
+def extract_judiciary(wb) -> list[dict]:
+    ws = find_sheet(wb, "Judiciary")
+    if ws is None:
+        print("  WARN  sheet not found: Judiciary")
+        return []
+    raw = extract_records(ws)
+    col_map = {
+        "court_level":        "court_level",
+        "court_name":         "court_name",
+        "position":           "position",
+        "justice_judge_name": "judge_name",
+        "selection_method":   "selection_method",
+        "appointed_by_elected": "appointed_by",
+        "term_start":         "term_start",
+        "term_end":           "term_end",
+        "jurisdiction":       "jurisdiction",
+        "official_website":   "website",
+    }
+    records = _map_records(raw, col_map, "justice_judge_name")
+    print(f"  OK    Judiciary → judiciary.json ({len(records)} records)")
+    return records
+
+
 def main():
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     wb = openpyxl.load_workbook(XLSX_PATH, data_only=True)
@@ -549,6 +718,19 @@ def main():
     with open(OUTPUT_DIR / "candidates.json", "w", encoding="utf-8") as f:
         json.dump(election_candidates, f, indent=2, ensure_ascii=False)
     print(f"  OK    candidates → candidates.json ({len(election_candidates)} total)")
+
+    for extractor, filename in [
+        (extract_school_boards,    "school_boards.json"),
+        (extract_state_agencies,   "state_agencies.json"),
+        (extract_law_enforcement,  "law_enforcement.json"),
+        (extract_fire_ems,         "fire_ems.json"),
+        (extract_hospitals,        "hospitals.json"),
+        (extract_utilities_transit, "utilities_transit.json"),
+        (extract_judiciary,        "judiciary.json"),
+    ]:
+        records = extractor(wb)
+        with open(OUTPUT_DIR / filename, "w", encoding="utf-8") as f:
+            json.dump(records, f, indent=2, ensure_ascii=False)
 
 
 if __name__ == "__main__":
