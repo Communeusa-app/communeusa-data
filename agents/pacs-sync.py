@@ -199,10 +199,10 @@ def _yy(cycle: int) -> str:
     return str(cycle)[-2:]
 
 
-def bulk_files(cycle: int) -> list[tuple[str, Path, Optional[str]]]:
+def bulk_files(cycle: int) -> list[tuple[str, Path, bool]]:
     """
-    Returns list of (url, local_path, extracted_name_or_None).
-    extracted_name is the expected filename inside the zip; None means no unzip needed.
+    Returns list of (url, local_path, is_zip).
+    is_zip=False means the file is already usable as-is (no extraction needed).
     """
     yy = _yy(cycle)
     base = f"{FEC_BULK_BASE}/{cycle}"
@@ -210,11 +210,11 @@ def bulk_files(cycle: int) -> list[tuple[str, Path, Optional[str]]]:
     return [
         (f"{base}/independent_expenditure_{cycle}.csv",
          d / f"independent_expenditure_{cycle}.csv",
-         None),                                    # already CSV, no zip
-        (f"{base}/cm{yy}.zip",  d / f"cm{yy}.zip",     f"cm{yy}.txt"),
-        (f"{base}/webk{yy}.zip", d / f"webk{yy}.zip",   f"webk{yy}.txt"),
-        (f"{base}/itpas2{yy}.zip", d / f"itpas2{yy}.zip", f"itpas2{yy}.txt"),
-        (f"{base}/itcont{yy}.zip",  d / f"itcont{yy}.zip",  f"itcont{yy}.txt"),
+         False),
+        (f"{base}/cm{yy}.zip",     d / f"cm{yy}.zip",     True),
+        (f"{base}/webk{yy}.zip",   d / f"webk{yy}.zip",   True),
+        (f"{base}/itpas2{yy}.zip", d / f"itpas2{yy}.zip", True),
+        (f"{base}/itcont{yy}.zip", d / f"itcont{yy}.zip", True),
     ]
 
 
@@ -234,22 +234,62 @@ def download_file(url: str, dest: Path) -> None:
     log.info("  → %.1f MB saved", dest.stat().st_size / (1 << 20))
 
 
-def unzip_file(zip_path: Path, member: str) -> Path:
-    """Extract a single member from zip_path into the same directory."""
-    dest = zip_path.parent / member
-    if dest.exists():
-        log.info("Already extracted: %s", dest.name)
-        return dest
-    log.info("Extracting %s from %s", member, zip_path.name)
+def unzip_file(zip_path: Path) -> Path:
+    """
+    Extract the data file from a FEC bulk zip without assuming the inner filename.
+
+    Strategy:
+      1. List all non-directory members.
+      2. If exactly one, use it.
+      3. If multiple, prefer .txt/.csv files; among those take the largest.
+    Logs which member was selected and returns the extracted path.
+    """
     with zipfile.ZipFile(zip_path) as zf:
-        # FEC zips sometimes use uppercase or lowercase names
-        names = {n.lower(): n for n in zf.namelist()}
-        actual = names.get(member.lower(), member)
-        zf.extract(actual, zip_path.parent)
-        extracted = zip_path.parent / actual
-        if actual != member:
+        members = [i for i in zf.infolist() if not i.filename.endswith("/")]
+        if not members:
+            raise ValueError(f"No files found inside {zip_path.name}")
+
+        if len(members) == 1:
+            info = members[0]
+        else:
+            data_members = [i for i in members
+                            if i.filename.lower().endswith((".txt", ".csv"))]
+            candidates = data_members if data_members else members
+            info = max(candidates, key=lambda i: i.file_size)
+
+        dest = zip_path.parent / Path(info.filename).name
+        if dest.exists():
+            log.info("Already extracted: %s (from %s)", dest.name, zip_path.name)
+            return dest
+
+        log.info("Extracting %s from %s (%.1f MB uncompressed)",
+                 info.filename, zip_path.name, info.file_size / (1 << 20))
+        zf.extract(info.filename, zip_path.parent)
+        extracted = zip_path.parent / info.filename
+        # Flatten any subdirectory the zip may have created
+        if extracted != dest:
             extracted.rename(dest)
-    return dest
+        return dest
+
+
+def find_extracted(zip_path: Path) -> Optional[Path]:
+    """
+    Return the already-extracted data file for a zip, or None if not yet extracted.
+    Looks for any .txt/.csv sibling whose stem matches the zip stem (case-insensitive),
+    or falls back to any .txt/.csv in the same directory that isn't a zip.
+    """
+    stem = zip_path.stem.lower()
+    parent = zip_path.parent
+    # Exact-stem match first (e.g. cm24.zip → cm24.txt or CM24.TXT)
+    for ext in (".txt", ".csv"):
+        candidate = parent / (zip_path.stem + ext)
+        if candidate.exists():
+            return candidate
+        # case-insensitive scan
+        for p in parent.iterdir():
+            if p.suffix.lower() == ext and p.stem.lower() == stem:
+                return p
+    return None
 
 
 def phase_download(cycle: int) -> dict[str, Path]:
@@ -257,20 +297,23 @@ def phase_download(cycle: int) -> dict[str, Path]:
     Download all needed FEC bulk files, unzip where required.
     Returns mapping of logical name → extracted file path.
     """
-    yy = _yy(cycle)
     files = bulk_files(cycle)
     result: dict[str, Path] = {}
     names = ["ie", "cm", "webk", "itpas2", "itcont"]
 
-    for (url, local, member), name in zip(files, names):
+    for (url, local, is_zip), name in zip(files, names):
         if not local.exists():
             download_file(url, local)
         else:
             log.info("Already present: %s", local.name)
 
-        if member:
-            extracted = unzip_file(local, member)
-            result[name] = extracted
+        if is_zip:
+            already = find_extracted(local)
+            if already:
+                log.info("Already extracted: %s (from %s)", already.name, local.name)
+                result[name] = already
+            else:
+                result[name] = unzip_file(local)
         else:
             result[name] = local
 
@@ -695,21 +738,12 @@ def main() -> None:
     done             = set(progress.get("phases_complete", []))
 
     # ── Download ──────────────────────────────────────────────────────────────
+    # phase_download is idempotent: skips files already on disk and
+    # zips already extracted, so it is safe to call on every run.
+    paths = phase_download(cycle)
     if "download" not in done:
-        paths = phase_download(cycle)
         progress["phases_complete"].append("download")
         save_progress(progress)
-    else:
-        log.info("[download] already complete — loading paths")
-        yy = _yy(cycle)
-        d  = BULK_DIR / str(cycle)
-        paths = {
-            "ie":     d / f"independent_expenditure_{cycle}.csv",
-            "cm":     d / f"cm{yy}.txt",
-            "webk":   d / f"webk{yy}.txt",
-            "itpas2": d / f"itpas2{yy}.txt",
-            "itcont": d / f"itcont{yy}.txt",
-        }
 
     # ── Load reference files (always needed regardless of checkpoint) ─────────
     cm   = load_cm(paths["cm"])
