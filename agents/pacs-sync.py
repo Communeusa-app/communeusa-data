@@ -58,7 +58,7 @@ log = logging.getLogger("pacs-sync")
 # ── Constants ──────────────────────────────────────────────────────────────────
 
 FEC_BULK_BASE          = "https://www.fec.gov/files/bulk-downloads"
-BATCH_SIZE             = 200
+BATCH_SIZE             = 500
 RETRY_ATTEMPTS         = 3
 RETRY_DELAY            = 2.0    # seconds between Supabase retry attempts
 MAX_DONORS_PER_CMTE    = 200    # top-N donors to keep per committee
@@ -582,11 +582,12 @@ def phase_pacs(
     ie_inserted = 0
     now = datetime.now(timezone.utc).isoformat()
 
+    # Build all pac rows up front
+    pac_rows = []
     for cmte_id in sorted(committee_ids):
-        info  = cm.get(cmte_id, {})
-        fins  = webk.get(cmte_id, {})
-
-        pac_row = {
+        info = cm.get(cmte_id, {})
+        fins = webk.get(cmte_id, {})
+        pac_rows.append({
             "fec_committee_id": cmte_id,
             "name":             info.get("name") or cmte_id,
             "committee_type":   info.get("committee_type") or "other",
@@ -598,44 +599,60 @@ def phase_pacs(
             "state":            info.get("state"),
             "website":          None,
             "updated_at":       now,
-        }
+        })
 
-        if dry_run:
-            pac_id_map[cmte_id] = f"dry-run-{cmte_id}"
-            log.info("[DRY-RUN] would upsert pacs for %s (%s)", cmte_id, pac_row["name"])
+    if dry_run:
+        for row in pac_rows:
+            pac_id_map[row["fec_committee_id"]] = f"dry-run-{row['fec_committee_id']}"
+        log.info("[DRY-RUN] would upsert %d pacs rows", len(pac_rows))
+    else:
+        # Batch upsert — no .select() chained, just .execute()
+        n_batches = (len(pac_rows) + BATCH_SIZE - 1) // BATCH_SIZE
+        upserted = 0
+        for i in range(0, len(pac_rows), BATCH_SIZE):
+            chunk = pac_rows[i:i + BATCH_SIZE]
+            batch_num = i // BATCH_SIZE + 1
+            for attempt in range(RETRY_ATTEMPTS):
+                try:
+                    supabase.table("pacs").upsert(chunk, on_conflict="fec_committee_id").execute()
+                    upserted += len(chunk)
+                    log.info("[PACS] upserted batch %d/%d (%d rows)", batch_num, n_batches, len(chunk))
+                    break
+                except Exception as exc:
+                    if attempt < RETRY_ATTEMPTS - 1:
+                        log.warning("[PACS] batch %d attempt %d/%d failed: %s — retrying",
+                                    batch_num, attempt + 1, RETRY_ATTEMPTS, exc)
+                        time.sleep(RETRY_DELAY)
+                    else:
+                        log.error("[PACS] batch %d failed after %d attempts: %s",
+                                  batch_num, RETRY_ATTEMPTS, exc)
+        log.info("[PACS] upserted %d total rows", upserted)
+
+        # Fetch back id + fec_committee_id in a separate query to build pac_id_map
+        cmte_list = sorted(committee_ids)
+        for i in range(0, len(cmte_list), 1000):
+            res = (supabase.table("pacs")
+                   .select("id,fec_committee_id")
+                   .in_("fec_committee_id", cmte_list[i:i + 1000])
+                   .execute())
+            for row in res.data or []:
+                pac_id_map[row["fec_committee_id"]] = row["id"]
+        log.info("[PACS] fetched %d pac_id entries from DB", len(pac_id_map))
+
+    # Insert IE rows per committee using the fetched IDs
+    for cmte_id, ie_rows in ie_rows_by_committee.items():
+        pac_id = pac_id_map.get(cmte_id)
+        if not pac_id:
+            log.warning("[PACS] no pac_id for %s — skipping IEs", cmte_id)
             continue
+        stamped = [{**r, "pac_id": pac_id} for r in ie_rows]
+        ie_inserted += sb_delete_then_insert(
+            supabase, "pac_independent_expenditures",
+            stamped, "pac_id", pac_id, cycle, dry_run,
+        )
 
-        for attempt in range(RETRY_ATTEMPTS):
-            try:
-                res = (supabase.table("pacs")
-                       .upsert(pac_row, on_conflict="fec_committee_id")
-                       .select("id")
-                       .single()
-                       .execute())
-                pac_id = res.data["id"]
-                pac_id_map[cmte_id] = pac_id
-                break
-            except Exception as exc:
-                if attempt < RETRY_ATTEMPTS - 1:
-                    log.warning("[PACS] upsert %s attempt %d failed: %s — retrying",
-                                cmte_id, attempt + 1, exc)
-                    time.sleep(RETRY_DELAY)
-                else:
-                    log.error("[PACS] upsert %s failed: %s", cmte_id, exc)
-
-        if cmte_id not in pac_id_map:
-            continue
-
-        pac_id = pac_id_map[cmte_id]
-        ie_rows = ie_rows_by_committee.get(cmte_id, [])
-        if ie_rows:
-            stamped = [{**r, "pac_id": pac_id} for r in ie_rows]
-            ie_inserted += sb_delete_then_insert(
-                supabase, "pac_independent_expenditures",
-                stamped, "pac_id", pac_id, cycle, dry_run,
-            )
-
-    log.info("[PACS] upserted %d rows; inserted %d IE rows", len(pac_id_map), ie_inserted)
+    log.info("[PACS] inserted %d IE rows across %d committees",
+             ie_inserted, len(ie_rows_by_committee))
     return pac_id_map
 
 
