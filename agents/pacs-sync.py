@@ -235,11 +235,17 @@ def bulk_files(cycle: int) -> list[tuple[str, Path, bool]]:
         (f"{base}/independent_expenditure_{cycle}.csv",
          d / f"independent_expenditure_{cycle}.csv",
          False),
-        (f"{base}/cm{yy}.zip",     d / f"cm{yy}.zip",     True),
-        (f"{base}/webk{yy}.zip",   d / f"webk{yy}.zip",   True),
-        (f"{base}/pas2{yy}.zip",   d / f"pas2{yy}.zip",   True),
-        (f"{base}/indiv{yy}.zip",   d / f"indiv{yy}.zip",   True),
+        (f"{base}/cm{yy}.zip",   d / f"cm{yy}.zip",   True),
+        (f"{base}/webk{yy}.zip", d / f"webk{yy}.zip", True),
+        (f"{base}/pas2{yy}.zip", d / f"pas2{yy}.zip", True),
     ]
+
+
+def donors_file(cycle: int) -> tuple[str, Path]:
+    """URL and local path for the large individual-contributions file (donors only)."""
+    yy   = _yy(cycle)
+    d    = BULK_DIR / str(cycle)
+    return (f"{FEC_BULK_BASE}/{cycle}/indiv{yy}.zip", d / f"indiv{yy}.zip")
 
 
 def download_file(url: str, dest: Path) -> bool:
@@ -341,7 +347,7 @@ def phase_download(cycle: int) -> dict[str, Optional[Path]]:
     """
     files = bulk_files(cycle)
     result: dict[str, Optional[Path]] = {}
-    names = ["ie", "cm", "webk", "itpas2", "itcont"]
+    names = ["ie", "cm", "webk", "itpas2"]
 
     for (url, local, is_zip), name in zip(files, names):
         if not local.exists():
@@ -815,33 +821,43 @@ def main() -> None:
                         help="FEC two-year cycle (e.g. 2024 or 2026)")
     parser.add_argument("--dry-run", action="store_true",
                         help="Parse and validate without writing to Supabase")
+    parser.add_argument("--reset", action="store_true",
+                        help="Delete the checkpoint file and start fresh")
+    parser.add_argument("--with-donors", action="store_true",
+                        help="Also download and load the large individual-contributions "
+                             "file (indiv{yy}.zip, 2 GB+). Skipped by default.")
     args = parser.parse_args()
 
-    cycle   = args.cycle
-    dry_run = args.dry_run
+    cycle      = args.cycle
+    dry_run    = args.dry_run
+    with_donors = args.with_donors
 
     supabase_url = os.environ.get("SUPABASE_URL")
     supabase_key = os.environ.get("SUPABASE_SERVICE_KEY")
     if not supabase_url or not supabase_key:
         sys.exit("ERROR: SUPABASE_URL and SUPABASE_SERVICE_KEY must be set in .env")
 
-    log.info("=== pacs-sync starting  cycle=%d  dry_run=%s ===", cycle, dry_run)
+    if args.reset and PROGRESS_FILE.exists():
+        PROGRESS_FILE.unlink()
+        log.info("Checkpoint deleted — starting fresh")
+
+    log.info("=== pacs-sync starting  cycle=%d  dry_run=%s  with_donors=%s ===",
+             cycle, dry_run, with_donors)
 
     supabase: Client = create_client(supabase_url, supabase_key)
     official_lookup  = build_official_lookup(supabase)
     progress         = load_progress(cycle)
     done             = set(progress.get("phases_complete", []))
 
-    # ── Download ──────────────────────────────────────────────────────────────
-    # phase_download is idempotent: skips files already on disk and
-    # zips already extracted, so it is safe to call on every run.
+    # ── Download (core files only — no donors) ────────────────────────────────
+    # phase_download is idempotent: skips files already on disk/extracted.
     paths = phase_download(cycle)
     if "download" not in done:
         progress["phases_complete"].append("download")
         save_progress(progress)
 
-    # ── Load reference files (always needed regardless of checkpoint) ─────────
-    cm   = load_cm(paths["cm"])   if paths.get("cm")   else {}
+    # ── Load reference files (always re-loaded; fast) ─────────────────────────
+    cm   = load_cm(paths["cm"])     if paths.get("cm")   else {}
     webk = load_webk(paths["webk"]) if paths.get("webk") else {}
     if not paths.get("cm"):
         log.warning("Committee master (cm) unavailable — pacs rows will have minimal metadata")
@@ -856,14 +872,22 @@ def main() -> None:
         ie_rows_by_committee, committee_ids = phase_ies(
             paths["ie"], cycle, official_lookup, supabase, dry_run,
         )
-        progress["committee_ids"]     = sorted(committee_ids)
-        progress["phases_complete"].append("ies")
-        save_progress(progress)
+        progress["committee_ids"] = sorted(committee_ids)
+        if committee_ids:
+            progress["phases_complete"].append("ies")
+            save_progress(progress)
+        else:
+            log.warning("[IEs] 0 committees parsed — NOT checkpointing; re-run will retry")
+            save_progress(progress)  # still save committee_ids list (empty) for visibility
     else:
         log.info("[IEs] already complete — reloading committee set from checkpoint")
         committee_ids        = set(progress.get("committee_ids", []))
-        ie_rows_by_committee = {}  # IEs already inserted; skip re-insert in phase_pacs
+        ie_rows_by_committee = {}  # already inserted; phase_pacs will skip IE insert
         log.info("[IEs] %d committees from checkpoint", len(committee_ids))
+
+    if not committee_ids:
+        log.error("No committees to process — cannot continue. Check IE file parsing.")
+        sys.exit(1)
 
     # ── PACs + IE insert ──────────────────────────────────────────────────────
     if "pacs" not in done:
@@ -871,8 +895,11 @@ def main() -> None:
             committee_ids, cm, webk, ie_rows_by_committee,
             cycle, supabase, dry_run,
         )
-        progress["phases_complete"].append("pacs")
-        save_progress(progress)
+        if pac_id_map:
+            progress["phases_complete"].append("pacs")
+            save_progress(progress)
+        else:
+            log.warning("[PACS] 0 committees upserted — NOT checkpointing; re-run will retry")
     else:
         log.info("[PACS] already complete — fetching pac_id_map from DB")
         pac_id_map = {}
@@ -890,26 +917,48 @@ def main() -> None:
     if "contributions" not in done:
         if not paths.get("itpas2"):
             log.warning("SKIP contributions phase — pas2 file unavailable (download failed)")
+        elif not pac_id_map:
+            log.warning("SKIP contributions phase — pac_id_map empty (pacs phase failed)")
         else:
-            phase_contributions(
+            n_contrib = phase_contributions(
                 paths["itpas2"], pac_id_map, official_lookup,
                 cycle, supabase, dry_run,
             )
-            progress["phases_complete"].append("contributions")
-            save_progress(progress)
+            if n_contrib > 0 or dry_run:
+                progress["phases_complete"].append("contributions")
+                save_progress(progress)
+            else:
+                log.warning("[CONTRIBS] 0 rows inserted — NOT checkpointing; re-run will retry")
     else:
         log.info("[CONTRIBS] already complete — skipping")
 
-    # ── Donors ────────────────────────────────────────────────────────────────
-    if "donors" not in done:
-        if not paths.get("itcont"):
-            log.warning("SKIP donors phase — itcont file unavailable (download failed)")
-        else:
-            phase_donors(paths["itcont"], pac_id_map, cycle, supabase, dry_run)
-            progress["phases_complete"].append("donors")
-            save_progress(progress)
-    else:
+    # ── Donors (opt-in only) ──────────────────────────────────────────────────
+    if not with_donors:
+        log.info("[DONORS] skipped (pass --with-donors to enable)")
+    elif "donors" in done:
         log.info("[DONORS] already complete — skipping")
+    else:
+        donor_url, donor_local = donors_file(cycle)
+        donor_path: Optional[Path] = None
+        if donor_local.exists():
+            log.info("Donors file already present: %s", donor_local.name)
+            already = find_extracted(donor_local)
+            donor_path = already if already else unzip_file(donor_local)
+        else:
+            log.info("Downloading donors file (large — may take several minutes)…")
+            ok = download_file(donor_url, donor_local)
+            if ok:
+                donor_path = unzip_file(donor_local)
+            else:
+                log.warning("SKIP donors phase — download failed")
+
+        if donor_path and pac_id_map:
+            n_donors = phase_donors(donor_path, pac_id_map, cycle, supabase, dry_run)
+            if n_donors > 0 or dry_run:
+                progress["phases_complete"].append("donors")
+                save_progress(progress)
+            else:
+                log.warning("[DONORS] 0 rows inserted — NOT checkpointing; re-run will retry")
 
     log.info("=== pacs-sync complete  cycle=%d  phases=%s ===",
              cycle, progress["phases_complete"])
