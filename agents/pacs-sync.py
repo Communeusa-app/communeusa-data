@@ -14,7 +14,7 @@ Files used:
   cm{yy}.zip                           — committee master (pipe-delimited, no header)
   webk{yy}.zip                         — PAC financials summary (pipe-delimited, no header)
   pas2{yy}.zip                         — committee-to-candidate contributions
-  itcont{yy}.zip                       — individual contributions to PACs (donors)
+  indiv{yy}.zip                        — individual contributions to PACs (donors)
 
 Required env vars (.env):
   SUPABASE_URL
@@ -150,11 +150,35 @@ def parse_fec_date(raw: object) -> Optional[str]:
 
 
 def parse_iso_date(raw: object) -> Optional[str]:
-    """Accept YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS variants (IE CSV file)."""
+    """Accept YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS variants."""
     s = clean(raw)
     if not s:
         return None
     return s[:10] if len(s) >= 10 else s
+
+
+def parse_fec_mon_date(raw: object) -> Optional[str]:
+    """
+    Parse the IE CSV date format DD-MON-YY (e.g. '27-SEP-24') → YYYY-MM-DD.
+    Also accepts MMDDYYYY (pipe-delimited files) and ISO variants as fallback.
+    """
+    s = clean(raw)
+    if not s:
+        return None
+    # DD-MON-YY or DD-MON-YYYY (FEC IE CSV)
+    try:
+        for fmt in ("%d-%b-%y", "%d-%b-%Y"):
+            try:
+                return datetime.strptime(s, fmt).strftime("%Y-%m-%d")
+            except ValueError:
+                pass
+    except Exception:
+        pass
+    # MMDDYYYY fallback (pipe-delimited files)
+    if len(s) == 8 and s.isdigit():
+        return f"{s[4:8]}-{s[0:2]}-{s[2:4]}"
+    # ISO fallback
+    return s[:10] if len(s) >= 10 else None
 
 
 def map_committee_type(code: Optional[str]) -> str:
@@ -214,7 +238,7 @@ def bulk_files(cycle: int) -> list[tuple[str, Path, bool]]:
         (f"{base}/cm{yy}.zip",     d / f"cm{yy}.zip",     True),
         (f"{base}/webk{yy}.zip",   d / f"webk{yy}.zip",   True),
         (f"{base}/pas2{yy}.zip",   d / f"pas2{yy}.zip",   True),
-        (f"{base}/itcont{yy}.zip", d / f"itcont{yy}.zip", True),
+        (f"{base}/indiv{yy}.zip",   d / f"indiv{yy}.zip",   True),
     ]
 
 
@@ -423,40 +447,56 @@ def build_official_lookup(supabase: Client) -> dict[str, str]:
 def phase_ies(ie_path: Path, cycle: int, official_lookup: dict[str, str],
               supabase: Client, dry_run: bool) -> tuple[dict[str, list[dict]], set[str]]:
     """
-    Parse the IE CSV. Returns:
-      - ie_rows_by_committee: {committee_id: [pac_ie row dicts]}  (pac_id not yet filled)
-      - committee_ids: set of all committee IDs seen
-    Rows are keyed by committee_id because we need the pacs.id (uuid) before inserting.
+    Parse the IE CSV (has header row; columns confirmed from FEC 2024 file):
+      spe_id   — committee/spender ID (the PAC making the expenditure)
+      spe_nam  — committee/spender name
+      cand_id  — FEC candidate ID
+      cand_name — candidate name ("LAST, FIRST" format)
+      sup_opp  — S (support) or O (oppose)
+      exp_amo  — expenditure amount
+      exp_date — expenditure date (DD-MON-YY, e.g. "27-SEP-24"; may be empty)
+      dissem_dt — dissemination date, used as fallback when exp_date is empty
+
+    Returns:
+      - ie_rows_by_committee: {spe_id: [pac_ie row dicts]}  (pac_id filled later)
+      - committee_ids: set of all spe_id values seen
     """
     log.info("[IEs] parsing %s", ie_path.name)
     ie_rows_by_committee: dict[str, list[dict]] = {}
     skipped = 0
     total = 0
+    debug_printed = 0
 
     with open(ie_path, newline="", encoding="utf-8-sig") as fh:
         reader = csv.DictReader(fh)
+        log.info("[IEs] header columns: %s", list(reader.fieldnames or []))
+
         for row in reader:
             total += 1
-            cmte_id = ie_field(row, "committee_id", "CMTE_ID")
+
+            # spe_id is the committee making the independent expenditure
+            cmte_id = ie_field(row, "spe_id", "committee_id", "CMTE_ID")
             if not cmte_id:
                 skipped += 1
                 continue
 
-            so_raw = ie_field(row, "support_oppose_indicator", "SUPOPPOSE", "SUPPORT_OPPOSE")
+            so_raw = ie_field(row, "sup_opp", "support_oppose_indicator", "SUPOPPOSE")
             if so_raw not in ("S", "O"):
                 skipped += 1
                 continue
 
-            cand_id   = ie_field(row, "candidate_id", "CAND_ID")
-            cand_name = ie_field(row, "candidate_name", "CAND_NAME", "NAME") or "Unknown"
-            amount    = parse_amount(ie_field(row, "expenditure_amount", "total",
-                                              "TRANSACTION_AMT", "amount"))
-            exp_date  = parse_iso_date(ie_field(row, "expenditure_date",
-                                                "dissemination_date", "TRANSACTION_DT"))
+            cand_id   = ie_field(row, "cand_id", "candidate_id", "CAND_ID")
+            cand_name = ie_field(row, "cand_name", "candidate_name", "CAND_NAME") or "Unknown"
+            amount    = parse_amount(ie_field(row, "exp_amo", "expenditure_amount",
+                                              "total", "TRANSACTION_AMT"))
+            # exp_date is DD-MON-YY (e.g. "27-SEP-24"); fall back to dissem_dt
+            raw_date  = ie_field(row, "exp_date", "dissem_dt", "expenditure_date",
+                                 "dissemination_date")
+            exp_date  = parse_fec_mon_date(raw_date)
 
             official_id = official_lookup.get(normalize_name(cand_name))
 
-            ie_rows_by_committee.setdefault(cmte_id, []).append({
+            record = {
                 "official_id":      official_id,
                 "candidate_name":   cand_name,
                 "fec_candidate_id": cand_id,
@@ -465,7 +505,13 @@ def phase_ies(ie_path: Path, cycle: int, official_lookup: dict[str, str],
                 "expenditure_date": exp_date,
                 "cycle":            cycle,
                 # pac_id filled in phase_pacs after upsert
-            })
+            }
+            ie_rows_by_committee.setdefault(cmte_id, []).append(record)
+
+            if debug_printed < 3:
+                log.info("[IEs] sample record %d: cmte=%s cand=%r amt=%s so=%s date=%s",
+                         debug_printed + 1, cmte_id, cand_name, amount, so_raw, exp_date)
+                debug_printed += 1
 
     committee_ids = set(ie_rows_by_committee.keys())
     log.info("[IEs] %d raw rows → %d valid, %d committees, %d skipped",
@@ -597,14 +643,32 @@ def phase_contributions(
     supabase: Client,
     dry_run: bool,
 ) -> int:
-    """Parse itpas2 for 24K contributions from our committees. Returns total inserted."""
+    """
+    Parse pas2 file (pipe-delimited, no header) for 24K contributions.
+    Column layout (0-based, from FEC data dictionary):
+      [0]  CMTE_ID        contributing PAC committee
+      [5]  TRANSACTION_TP 24K = direct contribution to candidate committee
+      [6]  ENTITY_TP
+      [7]  NAME           recipient name (campaign committee or candidate)
+      [13] TRANSACTION_DT MMDDYYYY
+      [14] TRANSACTION_AMT
+      [16] CAND_ID        FEC candidate ID of recipient
+    Returns total inserted.
+    """
     log.info("[CONTRIBS] parsing %s", itpas2_path.name)
     rows_by_pac: dict[str, list[dict]] = {}
     skipped = total = 0
+    debug_row_logged = False
+    debug_printed = 0
 
     with open(itpas2_path, newline="", encoding="latin-1") as fh:
         for row in csv.reader(fh, delimiter="|"):
             total += 1
+
+            if not debug_row_logged:
+                log.info("[CONTRIBS] first raw row (%d fields): %s", len(row), row)
+                debug_row_logged = True
+
             cmte_id = col(row, IT_CMTE_ID)
             if cmte_id not in pac_id_map:
                 skipped += 1
@@ -614,25 +678,35 @@ def phase_contributions(
                 skipped += 1
                 continue
 
-            cand_name = col(row, IT_NAME) or "Unknown"
-            cand_id   = col(row, IT_CAND_ID)
-            amount    = parse_amount(col(row, IT_TRANSACTION_AMT))
+            # col[7] is the recipient name (usually a campaign committee name)
+            recipient_name = col(row, IT_NAME) or "Unknown"
+            cand_id        = col(row, IT_CAND_ID)
+            amount         = parse_amount(col(row, IT_TRANSACTION_AMT))
             if not amount:
                 skipped += 1
                 continue
 
             pac_id      = pac_id_map[cmte_id]
-            official_id = official_lookup.get(normalize_name(cand_name))
+            # Name-match against officials using the recipient committee name as a
+            # best-effort proxy; cand_id lookup would be more accurate but requires
+            # an extra FEC candidate file.
+            official_id = official_lookup.get(normalize_name(recipient_name))
 
-            rows_by_pac.setdefault(pac_id, []).append({
+            record = {
                 "pac_id":            pac_id,
                 "official_id":       official_id,
-                "candidate_name":    cand_name,
+                "candidate_name":    recipient_name,
                 "fec_candidate_id":  cand_id,
                 "amount":            amount,
                 "contribution_date": parse_fec_date(col(row, IT_TRANSACTION_DT)),
                 "cycle":             cycle,
-            })
+            }
+            rows_by_pac.setdefault(pac_id, []).append(record)
+
+            if debug_printed < 3:
+                log.info("[CONTRIBS] sample record %d: cmte=%s recipient=%r cand_id=%s amt=%s",
+                         debug_printed + 1, cmte_id, recipient_name, cand_id, amount)
+                debug_printed += 1
 
     log.info("[CONTRIBS] %d raw rows → %d committees with 24K contribs (%d skipped)",
              total, len(rows_by_pac), skipped)
