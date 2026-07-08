@@ -13,7 +13,7 @@ Files used:
   independent_expenditure_{cycle}.csv  — itemized IE records (has header row)
   cm{yy}.zip                           — committee master (pipe-delimited, no header)
   webk{yy}.zip                         — PAC financials summary (pipe-delimited, no header)
-  itpas2{yy}.zip                       — committee-to-candidate contributions
+  pas2{yy}.zip                         — committee-to-candidate contributions
   itcont{yy}.zip                       — individual contributions to PACs (donors)
 
 Required env vars (.env):
@@ -213,25 +213,41 @@ def bulk_files(cycle: int) -> list[tuple[str, Path, bool]]:
          False),
         (f"{base}/cm{yy}.zip",     d / f"cm{yy}.zip",     True),
         (f"{base}/webk{yy}.zip",   d / f"webk{yy}.zip",   True),
-        (f"{base}/itpas2{yy}.zip", d / f"itpas2{yy}.zip", True),
+        (f"{base}/pas2{yy}.zip",   d / f"pas2{yy}.zip",   True),
         (f"{base}/itcont{yy}.zip", d / f"itcont{yy}.zip", True),
     ]
 
 
-def download_file(url: str, dest: Path) -> None:
-    """Stream-download url to dest, showing progress every 50 MB."""
+def download_file(url: str, dest: Path) -> bool:
+    """
+    Stream-download url to dest, showing progress every 50 MB.
+    Returns True on success, False on HTTP error (logged clearly) or network failure.
+    A partial download is removed so a re-run will retry cleanly.
+    """
     log.info("Downloading %s → %s", url, dest.name)
     dest.parent.mkdir(parents=True, exist_ok=True)
-    with requests.get(url, stream=True, timeout=120) as resp:
-        resp.raise_for_status()
-        written = 0
-        with open(dest, "wb") as fh:
-            for chunk in resp.iter_content(chunk_size=1 << 20):  # 1 MB
-                fh.write(chunk)
-                written += len(chunk)
-                if written % (50 << 20) == 0:
-                    log.info("  … %.0f MB", written / (1 << 20))
-    log.info("  → %.1f MB saved", dest.stat().st_size / (1 << 20))
+    try:
+        with requests.get(url, stream=True, timeout=120) as resp:
+            if not resp.ok:
+                log.error(
+                    "SKIP %s — HTTP %d %s (check FEC filename for cycle)",
+                    dest.name, resp.status_code, resp.reason,
+                )
+                return False
+            written = 0
+            with open(dest, "wb") as fh:
+                for chunk in resp.iter_content(chunk_size=1 << 20):  # 1 MB
+                    fh.write(chunk)
+                    written += len(chunk)
+                    if written % (50 << 20) == 0:
+                        log.info("  … %.0f MB", written / (1 << 20))
+        log.info("  → %.1f MB saved", dest.stat().st_size / (1 << 20))
+        return True
+    except Exception as exc:
+        log.error("SKIP %s — download failed: %s", dest.name, exc)
+        if dest.exists():
+            dest.unlink()
+        return False
 
 
 def unzip_file(zip_path: Path) -> Path:
@@ -292,18 +308,23 @@ def find_extracted(zip_path: Path) -> Optional[Path]:
     return None
 
 
-def phase_download(cycle: int) -> dict[str, Path]:
+def phase_download(cycle: int) -> dict[str, Optional[Path]]:
     """
     Download all needed FEC bulk files, unzip where required.
-    Returns mapping of logical name → extracted file path.
+    Returns mapping of logical name → extracted file path, or None if the
+    file could not be downloaded (404 or other error). Callers that need a
+    missing file will skip that phase and log a warning.
     """
     files = bulk_files(cycle)
-    result: dict[str, Path] = {}
+    result: dict[str, Optional[Path]] = {}
     names = ["ie", "cm", "webk", "itpas2", "itcont"]
 
     for (url, local, is_zip), name in zip(files, names):
         if not local.exists():
-            download_file(url, local)
+            ok = download_file(url, local)
+            if not ok:
+                result[name] = None
+                continue
         else:
             log.info("Already present: %s", local.name)
 
@@ -746,11 +767,18 @@ def main() -> None:
         save_progress(progress)
 
     # ── Load reference files (always needed regardless of checkpoint) ─────────
-    cm   = load_cm(paths["cm"])
-    webk = load_webk(paths["webk"])
+    cm   = load_cm(paths["cm"])   if paths.get("cm")   else {}
+    webk = load_webk(paths["webk"]) if paths.get("webk") else {}
+    if not paths.get("cm"):
+        log.warning("Committee master (cm) unavailable — pacs rows will have minimal metadata")
+    if not paths.get("webk"):
+        log.warning("PAC financials (webk) unavailable — total_raised/total_spent will be null")
 
     # ── IEs ───────────────────────────────────────────────────────────────────
     if "ies" not in done:
+        if not paths.get("ie"):
+            log.error("IE file unavailable — cannot determine committee set; aborting")
+            sys.exit(1)
         ie_rows_by_committee, committee_ids = phase_ies(
             paths["ie"], cycle, official_lookup, supabase, dry_run,
         )
@@ -759,7 +787,7 @@ def main() -> None:
         save_progress(progress)
     else:
         log.info("[IEs] already complete — reloading committee set from checkpoint")
-        committee_ids       = set(progress.get("committee_ids", []))
+        committee_ids        = set(progress.get("committee_ids", []))
         ie_rows_by_committee = {}  # IEs already inserted; skip re-insert in phase_pacs
         log.info("[IEs] %d committees from checkpoint", len(committee_ids))
 
@@ -786,20 +814,26 @@ def main() -> None:
 
     # ── Contributions ─────────────────────────────────────────────────────────
     if "contributions" not in done:
-        phase_contributions(
-            paths["itpas2"], pac_id_map, official_lookup,
-            cycle, supabase, dry_run,
-        )
-        progress["phases_complete"].append("contributions")
-        save_progress(progress)
+        if not paths.get("itpas2"):
+            log.warning("SKIP contributions phase — pas2 file unavailable (download failed)")
+        else:
+            phase_contributions(
+                paths["itpas2"], pac_id_map, official_lookup,
+                cycle, supabase, dry_run,
+            )
+            progress["phases_complete"].append("contributions")
+            save_progress(progress)
     else:
         log.info("[CONTRIBS] already complete — skipping")
 
     # ── Donors ────────────────────────────────────────────────────────────────
     if "donors" not in done:
-        phase_donors(paths["itcont"], pac_id_map, cycle, supabase, dry_run)
-        progress["phases_complete"].append("donors")
-        save_progress(progress)
+        if not paths.get("itcont"):
+            log.warning("SKIP donors phase — itcont file unavailable (download failed)")
+        else:
+            phase_donors(paths["itcont"], pac_id_map, cycle, supabase, dry_run)
+            progress["phases_complete"].append("donors")
+            save_progress(progress)
     else:
         log.info("[DONORS] already complete — skipping")
 
