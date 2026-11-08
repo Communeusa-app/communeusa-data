@@ -297,6 +297,11 @@ def get_wa_state_id(supabase: Client) -> str:
     return res.data["id"]
 
 
+def _is_state_legislator(row: dict) -> bool:
+    title = (row.get("office_title") or "").lower()
+    return "house" in title or "senate" in title or "senator" in title
+
+
 def get_existing_officials(supabase: Client, level: str) -> dict[str, dict]:
     """
     Return {official_name: canonical_row} for all officials at the given level.
@@ -316,6 +321,10 @@ def get_existing_officials(supabase: Client, level: str) -> dict[str, dict]:
     # Group by name, preserving DB order
     by_name: dict[str, list[dict]] = {}
     for r in res.data or []:
+        # The state source only lists legislators. Statewide offices (Governor, Attorney General, ...)
+        # live at the same level but are maintained separately, so never touch them here.
+        if level == "state" and not _is_state_legislator(r):
+            continue
         by_name.setdefault(r["official_name"], []).append(r)
 
     canonical: dict[str, dict] = {}
