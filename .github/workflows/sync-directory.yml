@@ -1,0 +1,59 @@
+name: Sync directory
+
+# Directory categories (hospitals, law enforcement, fire and EMS, schools, utilities, transit,
+# courts, colleges) from official WA sources, then city officials from MRSC.
+on:
+  schedule:
+    - cron: "11 8 1 * *"    # 1st of each month, 08:11 UTC
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Completeness sync: print changes without writing"
+        type: boolean
+        default: true
+      only:
+        description: "Completeness sync: only these categories, comma separated (e.g. fire_ems). Blank = all."
+        required: false
+        default: ""
+      include_cities:
+        description: "Also run the city officials sync"
+        type: boolean
+        default: false
+
+concurrency:
+  group: sync-directory
+  cancel-in-progress: false
+
+jobs:
+  completeness:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup
+      - name: Directory completeness
+        env:
+          DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run }}
+          ONLY: ${{ github.event_name == 'workflow_dispatch' && inputs.only || '' }}
+        run: |
+          args=()
+          if [ "$DRY_RUN" = "true" ]; then args+=(--dry-run); fi
+          if [ -n "$ONLY" ]; then args+=(--only "$ONLY"); fi
+          python agents/completeness-sync.py "${args[@]}"
+
+  cities:
+    if: github.event_name == 'schedule' || inputs.include_cities
+    needs: completeness
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup
+      - name: City officials (MRSC)
+        run: python agents/city-sync.py

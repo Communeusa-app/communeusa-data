@@ -1,0 +1,43 @@
+name: Sync campaign finance
+
+# WA PDC contributions and FEC itemized contributions, then PAC and Super PAC data
+# from FEC bulk files (the live FEC API is not used for PACs).
+on:
+  schedule:
+    - cron: "29 9 * * 3"    # Wednesdays 09:29 UTC
+  workflow_dispatch:
+    inputs:
+      cycle:
+        description: "FEC cycle for PAC data"
+        default: "2026"
+        required: false
+      dry_run:
+        description: "PAC sync: print changes without writing"
+        type: boolean
+        default: false
+
+concurrency:
+  group: sync-finance
+  cancel-in-progress: false
+
+jobs:
+  finance:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    env:
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+      FEC_API_KEY: ${{ secrets.FEC_API_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup
+      - name: Contributions (PDC and FEC)
+        run: python agents/finance-sync.py
+      - name: PACs and independent expenditures (FEC bulk files)
+        env:
+          CYCLE: ${{ github.event_name == 'workflow_dispatch' && inputs.cycle || '2026' }}
+          DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run }}
+        run: |
+          args=(--cycle "$CYCLE")
+          if [ "$DRY_RUN" = "true" ]; then args+=(--dry-run); fi
+          python agents/pacs-sync.py "${args[@]}"

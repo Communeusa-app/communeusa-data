@@ -1,0 +1,7 @@
+# Pinned for the scheduled data agents. Python 3.12 in CI.
+# redistricting-sync.py also needs geopandas; it is run by hand, not on a schedule.
+supabase==2.34.1
+requests==2.34.2
+beautifulsoup4==4.15.0
+python-dotenv==1.2.4
+openpyxl==3.1.5
