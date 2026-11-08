@@ -1,0 +1,25 @@
+name: Sync elections
+
+# Races, candidates and results from Ballotpedia and the WA Secretary of State.
+# Daily while results are still coming in; reduce to weekly once the cycle settles.
+on:
+  schedule:
+    - cron: "43 11 * * *"   # daily 11:43 UTC
+  workflow_dispatch:
+
+concurrency:
+  group: sync-elections
+  cancel-in-progress: false
+
+jobs:
+  elections:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup
+      - name: Elections and candidates
+        run: python agents/elections-sync.py
