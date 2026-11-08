@@ -31,6 +31,7 @@ jobs:
     env:
       SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
       SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+      FEC_API_KEY: ${{ secrets.FEC_API_KEY }}   # also used as the data.gov key (College Scorecard)
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/setup
