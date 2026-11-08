@@ -86,13 +86,17 @@ def ts() -> str:
 
 # ── Open States ───────────────────────────────────────────────────────────────
 
-def _get_with_retry(url, *, attempts: int = 4, **kwargs):
-    """requests.get that retries timeouts, connection drops and 429/5xx with backoff (5s, 10s, 20s)."""
+# 52x are Cloudflare "origin unreachable / timed out / unknown error" responses (Congress.gov sits behind it).
+RETRY_STATUSES = {429, 500, 502, 503, 504, 520, 521, 522, 523, 524}
+
+
+def _get_with_retry(url, *, attempts: int = 5, **kwargs):
+    """requests.get that retries timeouts, connection drops and 429/5xx with backoff (5s, 10s, 20s, 40s)."""
     kwargs.setdefault("timeout", 60)
     for attempt in range(1, attempts + 1):
         try:
             resp = requests.get(url, **kwargs)
-            if resp.status_code in (429, 500, 502, 503, 504) and attempt < attempts:
+            if resp.status_code in RETRY_STATUSES and attempt < attempts:
                 raise requests.exceptions.RequestException(f"HTTP {resp.status_code}")
             return resp
         except (requests.exceptions.Timeout, requests.exceptions.ConnectionError,
