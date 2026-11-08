@@ -86,6 +86,24 @@ def ts() -> str:
 
 # ── Open States ───────────────────────────────────────────────────────────────
 
+def _get_with_retry(url, *, attempts: int = 4, **kwargs):
+    """requests.get that retries timeouts, connection drops and 429/5xx with backoff (5s, 10s, 20s)."""
+    kwargs.setdefault("timeout", 60)
+    for attempt in range(1, attempts + 1):
+        try:
+            resp = requests.get(url, **kwargs)
+            if resp.status_code in (429, 500, 502, 503, 504) and attempt < attempts:
+                raise requests.exceptions.RequestException(f"HTTP {resp.status_code}")
+            return resp
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError,
+                requests.exceptions.RequestException) as exc:
+            if attempt == attempts:
+                raise
+            wait = 5 * 2 ** (attempt - 1)
+            log.warning("GET %s failed (%s); retry %d/%d in %ds", url.split("?")[0], exc, attempt, attempts - 1, wait)
+            time.sleep(wait)
+
+
 def fetch_openstates_legislators(api_key: str) -> list[dict]:
     """
     Return all current WA state legislators from Open States v3.
@@ -96,7 +114,7 @@ def fetch_openstates_legislators(api_key: str) -> list[dict]:
     per_page = 50
 
     while True:
-        resp = requests.get(
+        resp = _get_with_retry(
             f"{OPENSTATES_BASE}/people",
             params={
                 "jurisdiction": "wa",
@@ -105,7 +123,7 @@ def fetch_openstates_legislators(api_key: str) -> list[dict]:
                 "page":         page,
             },
             headers={"X-API-KEY": api_key},
-            timeout=30,
+            timeout=60,
         )
         resp.raise_for_status()
         data = resp.json()
@@ -217,7 +235,7 @@ def _fetch_congress_member_list(api_key: str) -> list[dict]:
     limit  = 250
 
     while True:
-        resp = requests.get(
+        resp = _get_with_retry(
             f"{CONGRESS_BASE}/member",
             params={
                 "stateCode":     "WA",
@@ -227,7 +245,7 @@ def _fetch_congress_member_list(api_key: str) -> list[dict]:
                 "format":        "json",
                 "api_key":       api_key,
             },
-            timeout=30,
+            timeout=60,
         )
         resp.raise_for_status()
         data = resp.json()
@@ -248,10 +266,10 @@ def _fetch_congress_member_list(api_key: str) -> list[dict]:
 def _fetch_congress_member_detail(member_url: str, api_key: str) -> dict:
     """Fetch the individual member detail page; return the 'member' dict."""
     try:
-        resp = requests.get(
+        resp = _get_with_retry(
             member_url,
             params={"format": "json", "api_key": api_key},
-            timeout=30,
+            timeout=60,
         )
         resp.raise_for_status()
         return resp.json().get("member", {})
