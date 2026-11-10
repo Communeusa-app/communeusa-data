@@ -51,7 +51,7 @@ REQUEST_DELAY        = 1.0  # seconds between HTTP requests
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (compatible; CommuneUSA-bot/1.0; "
-        "+https://communeusa.org)"
+        "+https://www.communeusa.com)"
     )
 }
 
@@ -157,25 +157,29 @@ def board_covers(title: str) -> bool:
     return bool(BOARD_TITLE.search(title or ""))
 
 
-def fetch_board_page() -> str:
-    resp = requests.get(WSAC_DIRECTORY, headers=HEADERS, timeout=30)
-    resp.raise_for_status()
-    return resp.text
+SNAPSHOT = Path(__file__).resolve().parent.parent / "data" / "wsac-board-snapshot.json"
 
 
-def parse_board(html: str) -> list[dict]:
-    """
-    Parse the WSAC member directory: one table row per county commissioner, councilmember or
-    county executive with columns County, District, Title, First Name, Last Name.
-    """
-    soup = BeautifulSoup(html, "html.parser")
+def fetch_board_page() -> Optional[str]:
+    """Live WSAC page, or None when the site refuses us (it returns 403 to GitHub's servers)."""
+    try:
+        resp = requests.get(WSAC_DIRECTORY, headers=HEADERS, timeout=30)
+        if resp.status_code == 200:
+            return resp.text
+        log.warning("WSAC directory returned HTTP %s", resp.status_code)
+    except requests.RequestException as exc:
+        log.warning("WSAC directory could not be fetched: %s", exc)
+    return None
+
+
+def board_rows_to_officials(table_rows: list[list[str]]) -> list[dict]:
+    """Rows of [county, district, title, first name, last name] -> officials."""
     results: list[dict] = []
-    for tr in soup.select("table tbody tr"):
-        cells = [clean(td.get_text(" ", strip=True)) for td in tr.find_all("td")]
+    for cells in table_rows:
         if len(cells) < 5 or not cells[0] or not cells[0].endswith(" County"):
             continue
-        county, _district, raw_title, first, last = cells[:5]
-        if not first or not last:
+        county, _district, raw_title, first, last = [clean(c) for c in cells[:5]]
+        if not first or not last or first.lower() == "vacant":
             continue
         m = re.match(r"^\S+\s*\((.+)\)$", first)      # 'Charles (Chuck)' -> 'Chuck'
         first = m.group(1) if m else first
@@ -196,6 +200,31 @@ def parse_board(html: str) -> list[dict]:
     log.info("Parsed %d county board members across %d counties (WSAC)",
              len(results), len({r["county_name"] for r in results}))
     return results
+
+
+def parse_board(html: str) -> list[dict]:
+    """Parse the WSAC member directory table (County, District, Title, First Name, Last Name)."""
+    soup = BeautifulSoup(html, "html.parser")
+    rows = [[clean(td.get_text(" ", strip=True)) or "" for td in tr.find_all("td")]
+            for tr in soup.select("table tbody tr")]
+    return board_rows_to_officials(rows)
+
+
+def load_board() -> list[dict]:
+    """Live page when reachable, otherwise the dated snapshot saved in data/."""
+    import json
+    html = fetch_board_page()
+    if html:
+        officials = parse_board(html)
+        if officials:
+            return officials
+        log.warning("WSAC page loaded but no board members were found")
+    snap = json.loads(SNAPSHOT.read_text())
+    msg = (f"Using the saved WSAC snapshot from {snap.get('captured')} because the live page "
+           "is not reachable. Board members will not update until the snapshot is refreshed.")
+    log.warning(msg)
+    print(f"::warning::{msg}")
+    return board_rows_to_officials(snap["rows"])
 
 
 NEW_DIRECTORY = "https://www.countyofficials.org/m/directory/department?did=193"
@@ -486,7 +515,7 @@ def main() -> None:
 
     sync_county_officials(supabase, wa_id, county_map, officials, source="the WACO directory")
 
-    board = parse_board(fetch_board_page())
+    board = load_board()
     sync_county_officials(supabase, wa_id, county_map, board, covers=board_covers,
                           source="the WSAC directory")
 
