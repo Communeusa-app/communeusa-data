@@ -19,6 +19,7 @@ Run:
 
 import logging
 import os
+import re
 import sys
 import time
 from datetime import datetime, timezone
@@ -93,6 +94,16 @@ def fetch_officials_page() -> str:
     First verifies the URL is still correct by checking the MRSC county profiles
     page, then fetches the officials directory.
     """
+    # The directory moved to a new page in 2026; try it first.
+    try:
+        resp0 = requests.get(NEW_DIRECTORY, headers=HEADERS, timeout=30)
+        if resp0.status_code == 200 and "category-staff" in resp0.text:
+            log.info("Using the new directory page")
+            return resp0.text
+        log.warning("New directory page not usable (HTTP %s); trying the old route", resp0.status_code)
+    except requests.RequestException as exc:
+        log.warning("New directory page failed (%s); trying the old route", exc)
+
     # Step 1 — confirm the officials directory URL from MRSC
     log.info("Fetching MRSC county profiles page to verify officials URL …")
     resp = requests.get(MRSC_COUNTY_PROFILES, headers=HEADERS, timeout=30)
@@ -119,7 +130,54 @@ def fetch_officials_page() -> str:
     return resp2.text
 
 
+NEW_DIRECTORY = "https://www.countyofficials.org/m/directory/department?did=193"
+
+
+def parse_officials_new(html: str) -> list[dict]:
+    """
+    Parse the redesigned countyofficials.org page (2026): an <h3> per county followed by a
+    <ul class="category-staff"> whose <li> rows hold name link, title and phone link.
+    """
+    soup = BeautifulSoup(html, "html.parser")
+    results: list[dict] = []
+    for h3 in soup.find_all("h3"):
+        heading = h3.get_text(" ", strip=True)
+        if not heading.endswith(" County"):
+            continue
+        county = strip_county_suffix(heading)
+        ul = h3.find_next("ul", class_="category-staff")
+        if ul is None:
+            continue
+        for li in ul.find_all("li", recursive=False):
+            link = li.find("a", href=lambda h: h and "directory/employee" in h)
+            if link is None:
+                continue
+            name = clean(link.get_text(" ", strip=True))
+            title_div = link.find_next("div")
+            title = clean(title_div.get_text(" ", strip=True)) if title_div else None
+            tel = li.find("a", href=lambda h: h and h.startswith("tel:"))
+            phone = clean(tel.get_text(" ", strip=True)) if tel else None
+            mail = li.find("a", href=lambda h: h and h.startswith("mailto:"))
+            email = clean(mail.get_text(" ", strip=True)) if mail else None
+            if not name or not title:
+                continue
+            results.append({
+                "county_name": county, "official_name": re.sub(r"\s+", " ", name),
+                "office_title": title, "phone": phone, "email": email,
+            })
+    log.info("Parsed %d county officials across %d counties (new layout)",
+             len(results), len({r["county_name"] for r in results}))
+    return results
+
+
 def parse_officials(html: str) -> list[dict]:
+    results = parse_officials_new(html)
+    if results:
+        return results
+    return parse_officials_old(html)
+
+
+def parse_officials_old(html: str) -> list[dict]:
     """
     Parse the countyofficials.org directory page.
 
