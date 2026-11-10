@@ -3,7 +3,13 @@
 sos-results-sync.py
 ===================
 Loads official candidates and vote counts from the Washington Secretary of State's results
-export (https://results.vote.wa.gov/results/<YYYYMMDD>/export.html) into the elections tables.
+export into the elections tables.
+
+Sources (tried in this order for --date):
+  1. https://results.votewa.gov/cdn/results/washington/export-<YYYYMMDD>.json   (2026 and later,
+     the state's new "Enhanced Voting" results site; "Media Export" on the Reports page)
+  2. https://results.vote.wa.gov/results/<YYYYMMDD>/export/<YYYYMMDD>_AllState.csv   (older elections)
+Either can also be passed directly with --file (a local file or a web address).
 
 What it does
   - Reads the export CSV (one row per candidate per contest).
@@ -41,9 +47,13 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(levelname)-8s  %(message)s")
 log = logging.getLogger("sos-results-sync")
 
-BASE = "https://results.vote.wa.gov/results/{date}/export/{date}_{name}.csv"
-DEFAULT_EXPORTS = ["AllState"]   # statewide, legislative, judicial and congressional contests
+JSON_URL = "https://results.votewa.gov/cdn/results/washington/export-{date}.json"
+CSV_URL = "https://results.vote.wa.gov/results/{date}/export/{date}_AllState.csv"
 MEASURE_WORDS = {"approved", "rejected", "yes", "no", "for", "against", "maintained", "repealed"}
+
+
+class NotFound(Exception):
+    pass
 
 
 # ── Parsing ───────────────────────────────────────────────────────────────────
@@ -51,7 +61,7 @@ MEASURE_WORDS = {"approved", "rejected", "yes", "no", "for", "against", "maintai
 def clean_party(raw: str) -> Optional[str]:
     """'(Prefers Democratic Party)' -> 'Democratic'. Judicial and blank values -> None."""
     raw = (raw or "").strip()
-    m = re.match(r"^\(\s*prefers\s+(.*?)\s*(?:party)?\s*\)$", raw, re.IGNORECASE)
+    m = re.match(r"^\(\s*(?:prefers|states)\s+(.*?)\s*(?:party)?\s*\)$", raw, re.IGNORECASE)
     value = (m.group(1) if m else raw).strip()
     if not value:
         return None
@@ -60,7 +70,9 @@ def clean_party(raw: str) -> Optional[str]:
         return "Democratic"
     if lowered in ("republican", "gop"):
         return "Republican"
-    if "no party" in lowered or lowered == "nonpartisan":
+    if "no party" in lowered:
+        return "No Party Preference"
+    if lowered == "nonpartisan":
         return "Nonpartisan"
     return value.title() if value.isupper() else value
 
@@ -153,7 +165,11 @@ def parse_rows(rows: list[dict]) -> list[dict]:
         if cand.lower() in MEASURE_WORDS:
             continue
         key = info["office_name"]
-        c = contests.setdefault(key, {**info, "candidates": []})
+        try:
+            seats = int(float(row.get("VoteFor") or 1))
+        except ValueError:
+            seats = 1
+        c = contests.setdefault(key, {**info, "seats": seats, "candidates": []})
         votes = int(float(row.get("Votes") or 0))
         pct = float(row.get("PercentageOfTotalVotes") or 0)
         c["candidates"].append({
@@ -178,21 +194,43 @@ def name_key(name: str) -> tuple:
 
 # ── Input ─────────────────────────────────────────────────────────────────────
 
+def rows_from_json(data: dict) -> list[dict]:
+    """Flatten the state's JSON export into the same row shape as the CSV files (plus VoteFor)."""
+    rows: list[dict] = []
+    for item in (data.get("results") or {}).get("ballotItems") or []:
+        if item.get("contestType") == "BallotMeasure":
+            continue   # measures are not handled yet
+        options = item.get("ballotOptions") or []
+        total = sum(int(o.get("voteCount") or 0) for o in options)
+        for o in options:
+            votes = int(o.get("voteCount") or 0)
+            rows.append({
+                "Race": item.get("name") or "",
+                "Candidate": o.get("name") or "",
+                "Party": o.get("politicalParty") or "",
+                "Votes": votes,
+                "PercentageOfTotalVotes": round(100.0 * votes / total, 2) if total else 0,
+                "JurisdictionName": "",
+                "VoteFor": item.get("voteFor") or 1,
+            })
+    return rows
+
+
 def read_source(src: str) -> list[dict]:
+    """Read a results file (CSV or the state's JSON export) from a web address or local path."""
     if re.match(r"https?://", src):
-        resp = requests.get(src, timeout=60, headers={"User-Agent": "CommuneUSA data agent"})
+        resp = requests.get(src, timeout=180, headers={"User-Agent": "CommuneUSA data agent"})
         if resp.status_code == 404:
-            sys.exit(
-                f"ERROR: not found: {src}\n"
-                "The state may not have posted this file yet, or it uses a different address. "
-                "Run again with the 'discover' option to list what the site offers, "
-                "then pass the right address with --file."
-            )
+            raise NotFound(src)
         resp.raise_for_status()
-        text = resp.content.decode("utf-8-sig", errors="replace")
+        raw = resp.content
     else:
-        with open(src, encoding="utf-8-sig") as fh:
-            text = fh.read()
+        with open(src, "rb") as fh:
+            raw = fh.read()
+    text = raw.decode("utf-8-sig", errors="replace")
+    if text.lstrip().startswith("{"):
+        import json
+        return rows_from_json(json.loads(text))
     return list(csv.DictReader(io.StringIO(text)))
 
 
@@ -239,7 +277,7 @@ def apply(contests: list[dict], election_date: str, certified: bool, dry_run: bo
             log.info("MATCH   %-52s -> %s", c["office_name"], matches[0]["office_name"])
             if not dry_run:
                 db.table("elections").update(
-                    {"results_status": status, "results_updated_at": now}
+                    {"results_status": status, "results_updated_at": now, "seats": c["seats"]}
                 ).eq("id", election_id).execute()
         else:
             stats["elections_created"] += 1
@@ -249,7 +287,7 @@ def apply(contests: list[dict], election_date: str, certified: bool, dry_run: bo
               res = db.table("elections").insert({
                 "state_id": wa, "office_name": c["office_name"], "level": c["level"],
                 "election_date": election_date, "source_url": "https://results.vote.wa.gov",
-                "results_status": status, "results_updated_at": now,
+                "results_status": status, "results_updated_at": now, "seats": c["seats"],
               }).execute()
               election_id = res.data[0]["id"]
 
@@ -290,18 +328,26 @@ def discover(date: str) -> None:
     """Print which results pages and export files the state site actually offers. Writes nothing."""
     hdr = {"User-Agent": "CommuneUSA data agent"}
     pages = [
+        JSON_URL.format(date=date),
+        CSV_URL.format(date=date),
+        f"https://results.votewa.gov/results/public/washington/elections/{date}/reports",
         "https://results.vote.wa.gov/",
         f"https://results.vote.wa.gov/results/{date}/export.html",
         f"https://results.vote.wa.gov/results/{date}/",
         f"https://results.vote.wa.gov/results/{date}/default.html",
     ]
     for page in pages:
+        is_data = page.endswith((".json", ".csv"))
         try:
-            r = requests.get(page, timeout=30, headers=hdr)
+            r = requests.get(page, timeout=30, headers=hdr, stream=is_data)
         except requests.RequestException as exc:
             print(f"{page}\n   could not connect: {exc}")
             continue
-        print(f"{page}\n   HTTP {r.status_code}")
+        size = r.headers.get("Content-Length")
+        print(f"{page}\n   HTTP {r.status_code}" + (f", {int(size):,} bytes" if size and size.isdigit() else ""))
+        if is_data:
+            r.close()
+            continue
         if r.status_code != 200:
             continue
         links = sorted(set(re.findall(r'href=["\']([^"\']+)["\']', r.text)))
@@ -332,16 +378,30 @@ def main() -> None:
         return
 
     sources = list(args.file)
-    if args.date:
-        if not re.fullmatch(r"\d{8}", args.date):
-            ap.error("--date must look like 20261103")
-        if not sources:   # an explicit --file replaces the default download
-            sources += [BASE.format(date=args.date, name=n) for n in DEFAULT_EXPORTS]
+    if args.date and not re.fullmatch(r"\d{8}", args.date):
+        ap.error("--date must look like 20261103")
 
     rows: list[dict] = []
-    for s in sources:
-        log.info("Reading %s", s)
-        rows += read_source(s)
+    if sources:
+        for src in sources:
+            log.info("Reading %s", src)
+            try:
+                rows += read_source(src)
+            except NotFound:
+                sys.exit(f"ERROR: not found: {src}")
+    else:
+        for src in (JSON_URL.format(date=args.date), CSV_URL.format(date=args.date)):
+            log.info("Reading %s", src)
+            try:
+                rows = read_source(src)
+                break
+            except NotFound:
+                log.warning("Not found: %s", src)
+        else:
+            sys.exit(
+                "ERROR: no results file found for this date. The state may not have posted it yet. "
+                "Run again with the 'discover' option to see what the site offers."
+            )
     contests = parse_rows(rows)
     log.info("Parsed %d contests, %d candidates", len(contests), sum(len(c["candidates"]) for c in contests))
 
