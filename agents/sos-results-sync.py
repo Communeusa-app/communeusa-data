@@ -142,6 +142,9 @@ def county_name_of(jurisdiction: str) -> Optional[str]:
     return m.group(1).strip() if m else None
 
 
+REPEATED_NAME_CITIES = {"walla walla"}
+
+
 def generic_city_contest(race: str) -> Optional[dict]:
     """City and town offices as named in the county result files ('CITY OF OTHELLO Council Position 2')."""
     m = re.match(r"(?:city|town) of (.+)$", race, re.I)
@@ -167,12 +170,15 @@ def generic_city_contest(race: str) -> Optional[dict]:
             return " ".join(w[: len(w) // 2])
         return None
 
+    name = re.sub(r"[\s\-–]+$", "", name).strip()
     # The state often repeats the name ('OAK HARBOR Oak Harbor City'): collapse it.
-    collapsed = collapse(name)
-    if not collapsed:
+    # Some real names repeat a word ('Walla Walla'), which must stay as they are.
+    collapsed = None if name.lower() in REPEATED_NAME_CITIES else collapse(name)
+    if not collapsed and name.lower() not in REPEATED_NAME_CITIES:
         trimmed = re.sub(r"\s+(?:city|town)$", "", name, flags=re.I)
         collapsed = collapse(trimmed)
-    if not collapsed and len(name.split()) >= 2 and name.split()[-1].lower() == name.split()[0].lower():
+    if not collapsed and name.lower() not in REPEATED_NAME_CITIES \
+            and len(name.split()) >= 2 and name.split()[-1].lower() == name.split()[0].lower():
         collapsed = " ".join(name.split()[:-1])
     if collapsed:
         name = collapsed
