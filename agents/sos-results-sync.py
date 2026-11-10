@@ -181,6 +181,13 @@ def name_key(name: str) -> tuple:
 def read_source(src: str) -> list[dict]:
     if re.match(r"https?://", src):
         resp = requests.get(src, timeout=60, headers={"User-Agent": "CommuneUSA data agent"})
+        if resp.status_code == 404:
+            sys.exit(
+                f"ERROR: not found: {src}\n"
+                "The state may not have posted this file yet, or it uses a different address. "
+                "Run again with the 'discover' option to list what the site offers, "
+                "then pass the right address with --file."
+            )
         resp.raise_for_status()
         text = resp.content.decode("utf-8-sig", errors="replace")
     else:
@@ -279,23 +286,57 @@ def apply(contests: list[dict], election_date: str, certified: bool, dry_run: bo
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
+def discover(date: str) -> None:
+    """Print which results pages and export files the state site actually offers. Writes nothing."""
+    hdr = {"User-Agent": "CommuneUSA data agent"}
+    pages = [
+        "https://results.vote.wa.gov/",
+        f"https://results.vote.wa.gov/results/{date}/export.html",
+        f"https://results.vote.wa.gov/results/{date}/",
+        f"https://results.vote.wa.gov/results/{date}/default.html",
+    ]
+    for page in pages:
+        try:
+            r = requests.get(page, timeout=30, headers=hdr)
+        except requests.RequestException as exc:
+            print(f"{page}\n   could not connect: {exc}")
+            continue
+        print(f"{page}\n   HTTP {r.status_code}")
+        if r.status_code != 200:
+            continue
+        links = sorted(set(re.findall(r'href=["\']([^"\']+)["\']', r.text)))
+        keep = [l for l in links if re.search(r"results/\d{8}|\.csv|\.xml|export", l, re.I)]
+        for l in keep[:60]:
+            print(f"   {l}")
+        if not keep:
+            print("   (no results or export links on this page)")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="Load Washington Secretary of State results into CommuneUSA.")
     ap.add_argument("--date", help="Election date as YYYYMMDD, e.g. 20261103 (downloads the export files)")
     ap.add_argument("--file", action="append", default=[], help="Local CSV or URL (repeatable) instead of --date downloads")
     ap.add_argument("--dry-run", action="store_true", help="Show what would change, write nothing")
     ap.add_argument("--parse-only", action="store_true", help="Parse the files and print contests; no database access")
+    ap.add_argument("--discover", action="store_true", help="List the results pages and export files the state site offers for --date, then exit")
     ap.add_argument("--certified", action="store_true", help="Mark results as certified (default: unofficial)")
     args = ap.parse_args()
 
     if not args.date and not args.file:
         ap.error("give --date or --file")
 
+    if args.discover:
+        if not args.date:
+            ap.error("--discover needs --date")
+        discover(args.date)
+        return
+
     sources = list(args.file)
     if args.date:
         if not re.fullmatch(r"\d{8}", args.date):
             ap.error("--date must look like 20261103")
-        sources += [BASE.format(date=args.date, name=n) for n in DEFAULT_EXPORTS]
+        if not sources:   # an explicit --file replaces the default download
+            sources += [BASE.format(date=args.date, name=n) for n in DEFAULT_EXPORTS]
 
     rows: list[dict] = []
     for s in sources:
