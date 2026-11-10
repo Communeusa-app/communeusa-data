@@ -130,6 +130,24 @@ def fetch_officials_page() -> str:
     return resp2.text
 
 
+CREDENTIALS = re.compile(r",?\s+(D-ABMDI|F-ABMDI|MD|M\.D\.|DO|PhD)\s*$", re.I)
+
+
+def clean_person_name(raw: str) -> Optional[str]:
+    """'Bill Leach, D-ABMDI' -> 'Bill Leach'. Returns None for vacant seats."""
+    name = re.sub(r"\s+", " ", raw).strip()
+    if not name or re.fullmatch(r"(vacant\s*)+", name, re.I):
+        return None
+    for _ in range(2):
+        name = CREDENTIALS.sub("", name).strip()
+    return name or None
+
+
+def base_title(title: str) -> str:
+    """'Sheriff (Interim)' -> 'sheriff'."""
+    return re.sub(r"\s*\(.*?\)", "", title or "").strip().lower()
+
+
 NEW_DIRECTORY = "https://www.countyofficials.org/m/directory/department?did=193"
 
 
@@ -161,8 +179,11 @@ def parse_officials_new(html: str) -> list[dict]:
             email = clean(mail.get_text(" ", strip=True)) if mail else None
             if not name or not title:
                 continue
+            name = clean_person_name(name)
+            if not name:
+                continue   # vacant seat
             results.append({
-                "county_name": county, "official_name": re.sub(r"\s+", " ", name),
+                "county_name": county, "official_name": name,
                 "office_title": title, "phone": phone, "email": email,
             })
     log.info("Parsed %d county officials across %d counties (new layout)",
@@ -325,6 +346,10 @@ def sync_county_officials(
             ", ".join(sorted(skipped_counties))
         )
 
+    # The source only lists some offices (the elected row officers). Never flag anyone inactive
+    # for an office the source does not cover, such as commissioners or councilmembers.
+    covered_titles = {base_title(r["office_title"]) for r in incoming}
+
     inserted = updated = flagged = 0
 
     # ── INSERT or UPDATE ──────────────────────────────────────────────────────
@@ -367,7 +392,8 @@ def sync_county_officials(
 
     # ── FLAG INACTIVE ─────────────────────────────────────────────────────────
     for key, db_row in existing.items():
-        if key not in incoming_keyed and db_row.get("is_active", True):
+        if key not in incoming_keyed and db_row.get("is_active", True) \
+                and base_title(key[1]) in covered_titles:
             supabase.table("officials").update({"is_active": False}).eq("id", db_row["id"]).execute()
             official_name, office_title, _ = key
             log.info("[%s] INACTIVE county  %s  —  %s", now, official_name, office_title)
