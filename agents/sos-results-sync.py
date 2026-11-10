@@ -152,12 +152,30 @@ def generic_city_contest(race: str) -> Optional[dict]:
     if not kw or re.search(r"proposition|levy|bond|measure|district no\. ?\d+ proposition", rest, re.I):
         return None
     name = rest[: kw.start()].strip()
-    name = re.sub(r"\s+(?:district|ward|dist\.?)\s*\d+$", "", name, flags=re.I).strip()
-    words = name.split()
-    if len(words) >= 2 and len(words) % 2 == 0 and words[: len(words) // 2] == words[len(words) // 2:]:
-        name = " ".join(words[: len(words) // 2])
-    elif len(words) >= 2 and words[-1].lower() == words[0].lower():
-        name = " ".join(words[:-1])
+    name = re.sub(r"\b(?:city|town) of\b", " ", name, flags=re.I).replace(",", " ")
+    name = re.sub(r"\s+", " ", name).strip()
+    suffix = ""
+    m2 = re.search(r"\s+((?:district|ward|dist\.?)\s*(?:no\.?\s*)?\d+)$", name, re.I)
+    if m2:
+        suffix = re.sub(r"\s+", " ", title_case(m2.group(1)))
+        name = name[: m2.start()].strip()
+    name = re.sub(r"\s+(?:north|south|east|west|central)\s+ward$", "", name, flags=re.I).strip()
+    def collapse(text: str) -> Optional[str]:
+        w = text.split()
+        lw = [x.lower() for x in w]
+        if len(w) >= 2 and len(w) % 2 == 0 and lw[: len(w) // 2] == lw[len(w) // 2:]:
+            return " ".join(w[: len(w) // 2])
+        return None
+
+    # The state often repeats the name ('OAK HARBOR Oak Harbor City'): collapse it.
+    collapsed = collapse(name)
+    if not collapsed:
+        trimmed = re.sub(r"\s+(?:city|town)$", "", name, flags=re.I)
+        collapsed = collapse(trimmed)
+    if not collapsed and len(name.split()) >= 2 and name.split()[-1].lower() == name.split()[0].lower():
+        collapsed = " ".join(name.split()[:-1])
+    if collapsed:
+        name = collapsed
     if not name:
         return None
     city = title_case(name)
@@ -177,7 +195,9 @@ def generic_city_contest(race: str) -> Optional[dict]:
     label = re.sub(r"\b(?:position|pos\.?|no\.?)\s*", "Position ", label, flags=re.I)
     label = re.sub(r"#\s*0*(\d+)", r"Position \1", label)
     label = re.sub(r"\bposition\s+position\b", "Position", label, flags=re.I)
-    label = re.sub(r"\s+", " ", title_case(label)).strip()
+    label = re.sub(r"\s+", " ", title_case(label.replace(",", " "))).strip()
+    if suffix and suffix.lower() not in label.lower():
+        label = f"{suffix} {label}".strip()
     return dict(kind="city", district=None, position=None, level="city", city=city,
                 office_name=f"{city} City Council {label}".strip())
 
@@ -187,6 +207,11 @@ def city_contest(race: str) -> Optional[dict]:
     m = re.match(r"city of (.+?) - council district no\.? ?(\d+)$", race, re.I)
     if m:
         city, n = m.group(1).strip(), int(m.group(2))
+        return dict(kind="city", district=n, position=None, level="city", city=city,
+                    office_name=f"{city} City Council District {n}")
+    m = re.match(r"(.+?) - city council ?,? ?(?:district|dist\.?) ?(?:no\.? ?)?(\d+)$", race, re.I)
+    if m:
+        city, n = re.sub(r"^(?:city|town) of ", "", m.group(1).strip(), flags=re.I), int(m.group(2))
         return dict(kind="city", district=n, position=None, level="city", city=city,
                     office_name=f"{city} City Council District {n}")
     generic = generic_city_contest(race)
@@ -485,9 +510,11 @@ def apply(contests: list[dict], election_date: str, certified: bool, dry_run: bo
         municipality_id = None
         if c["kind"] == "city":
             municipality_id = city_ids.get(c["city"].lower())
-            if not municipality_id and c["city"].lower().endswith(" city"):
+            for tail in (" city", " town"):
+                if municipality_id or not c["city"].lower().endswith(tail):
+                    continue
                 # 'ASOTIN CITY COUNCIL ...' is read as city 'Asotin City'; try without the trailing word.
-                short = c["city"][: -len(" city")]
+                short = c["city"][: -len(tail)]
                 municipality_id = city_ids.get(short.lower())
                 if municipality_id:
                     c["office_name"] = c["office_name"].replace(c["city"], short, 1)
