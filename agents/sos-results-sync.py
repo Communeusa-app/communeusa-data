@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import html
 import io
 import logging
 import os
@@ -153,6 +154,34 @@ def city_contest(race: str) -> Optional[dict]:
     return None
 
 
+STATEWIDE_OFFICES = {
+    "governor": "Washington Governor",
+    "lt. governor": "Washington Lieutenant Governor",
+    "lieutenant governor": "Washington Lieutenant Governor",
+    "attorney general": "Washington Attorney General",
+    "secretary of state": "Washington Secretary of State",
+    "state treasurer": "Washington Treasurer",
+    "treasurer": "Washington Treasurer",
+    "state auditor": "Washington State Auditor",
+    "commissioner of public lands": "Washington Commissioner of Public Lands",
+    "insurance commissioner": "Washington Insurance Commissioner",
+    "superintendent of public instruction": "Washington Superintendent of Public Instruction",
+}
+
+
+def election_type_for(election_date: str) -> str:
+    """'2026-08-04' -> 'primary', November -> 'general', anything else -> 'special'."""
+    month = int(election_date[5:7])
+    return "general" if month == 11 else "primary" if month == 8 else "special"
+
+
+def normalize_judicial(r: str) -> str:
+    """'PIERCE SUPERIOR COURT - Judge Position 01' -> 'Pierce Superior Court - Judge Position 1'."""
+    r = html.unescape(re.sub(r"\s+", " ", r.strip()))
+    r = re.sub(r"#?0*(\d+)$", r"\1", r)
+    return title_case(r)
+
+
 def parse_contest(race: str, jurisdiction: str) -> Optional[dict]:
     """
     Turn a Secretary of State contest label into {kind, district, position, office_name, level}.
@@ -183,6 +212,14 @@ def parse_contest(race: str, jurisdiction: str) -> Optional[dict]:
         return dict(kind="ussenate", district=None, position=None, level="federal",
                     office_name="U.S. Senate Washington")
 
+    stripped = re.sub(r"^washington state - ", "", low)
+    if stripped in STATEWIDE_OFFICES:
+        return dict(kind="statewide", district=None, position=None, level="state",
+                    office_name=STATEWIDE_OFFICES[stripped])
+    if re.match(r"president( ?/ ?vice president)?$", low):
+        return dict(kind="statewide", district=None, position=None, level="federal",
+                    office_name="U.S. President Washington")
+
     county = county_name_of(jurisdiction)
     if county:
         city = city_contest(r)
@@ -196,11 +233,11 @@ def parse_contest(race: str, jurisdiction: str) -> Optional[dict]:
         return dict(kind="county", district=num, position=None, level="county", county=county,
                     office=label, office_name=f"{county} County {title}")
 
-    if jurisdiction.strip().lower() == "judicial" or re.match(
-        r"(supreme court|court of appeals|superior court)", low
+    if jurisdiction.strip().lower() == "judicial" or re.search(
+        r"supreme court|court of appeals|superior court|(judge|justice) position", low
     ):
         return dict(kind="judicial", district=None, position=None, level="state",
-                    office_name=title_case(r))
+                    office_name=normalize_judicial(r))
 
     return None
 
@@ -227,14 +264,14 @@ def parse_rows(rows: list[dict]) -> list[dict]:
     contests: dict[str, dict] = {}
     skipped: dict[str, int] = {}
     for row in rows:
-        race = (row.get("Race") or "").strip()
+        race = html.unescape((row.get("Race") or "").strip())
         if not race:
             continue
         info = parse_contest(race, row.get("JurisdictionName") or "")
         if info is None:
             skipped[race] = skipped.get(race, 0) + 1
             continue
-        cand = (row.get("Candidate") or "").strip()
+        cand = html.unescape((row.get("Candidate") or "").strip())
         if not cand or cand.upper() == "WRITE-IN":
             continue
         if cand.lower() in MEASURE_WORDS:
@@ -365,6 +402,7 @@ def apply(contests: list[dict], election_date: str, certified: bool, dry_run: bo
         by_key.setdefault(parse_existing_name(e["office_name"]), []).append(e)
 
     now = datetime.now(timezone.utc).isoformat()
+    etype = election_type_for(election_date)
     status = "certified" if certified else "unofficial"
     stats = dict(elections_matched=0, elections_created=0, cand_updated=0, cand_inserted=0, ambiguous=0)
 
@@ -387,7 +425,7 @@ def apply(contests: list[dict], election_date: str, certified: bool, dry_run: bo
             matches = by_county.get((county_id, (c["office"], c["district"])), [])
         else:
             matches = None
-        k = (c["kind"], c["district"], c["position"]) if c["kind"] != "judicial" else (
+        k = (c["kind"], c["district"], c["position"]) if c["kind"] not in ("judicial", "statewide") else (
             "name", re.sub(r"[^a-z0-9]+", " ", c["office_name"].lower()).strip(), None)
         if matches is None:
             matches = by_key.get(k, [])
@@ -403,7 +441,7 @@ def apply(contests: list[dict], election_date: str, certified: bool, dry_run: bo
             keep = "certified" if matches[0].get("results_status") == "certified" else status
             if not dry_run:
                 db.table("elections").update(
-                    {"results_status": keep, "results_updated_at": now, "seats": c["seats"]}
+                    {"results_status": keep, "results_updated_at": now, "seats": c["seats"], "election_type": etype}
                 ).eq("id", election_id).execute()
         else:
             stats["elections_created"] += 1
@@ -414,6 +452,7 @@ def apply(contests: list[dict], election_date: str, certified: bool, dry_run: bo
                 "state_id": wa, "county_id": county_id, "municipality_id": municipality_id, "office_name": c["office_name"], "level": c["level"],
                 "election_date": election_date, "source_url": "https://results.vote.wa.gov",
                 "results_status": status, "results_updated_at": now, "seats": c["seats"],
+                "election_type": etype,
               }).execute()
               election_id = res.data[0]["id"]
 
@@ -422,11 +461,23 @@ def apply(contests: list[dict], election_date: str, certified: bool, dry_run: bo
             existing = db.table("candidates").select("id,name").eq("election_id", election_id).execute().data or []
         by_name = {name_key(x["name"]): x for x in existing}
 
+        # Outcomes are only recorded for certified results: top two advance from a primary,
+        # the top `seats` win a general election.
+        outcomes: dict[str, str] = {}
+        if certified:
+            ranked = sorted(c["candidates"], key=lambda x: x["votes"], reverse=True)
+            if etype == "primary":
+                outcomes = {x["name"]: "advanced" for x in ranked[:2]}
+            elif etype == "general":
+                outcomes = {x["name"]: "won" for x in ranked[: c.get("seats") or 1]}
+
         for cand in c["candidates"]:
             fields = {
                 "party": cand["party"], "votes": cand["votes"], "vote_pct": cand["vote_pct"],
                 "source": "wa_sos", "status": "verified", "verified_at": now,
             }
+            if certified:
+                fields["outcome"] = outcomes.get(cand["name"])
             hit = by_name.get(name_key(cand["name"]))
             if hit:
                 stats["cand_updated"] += 1
