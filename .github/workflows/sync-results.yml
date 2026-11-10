@@ -1,8 +1,12 @@
 name: Sync official results
 
 # Candidates and vote counts from the WA Secretary of State results export.
-# Manual for now: run it after election night and again after certification.
+# Runs every evening (Pacific) while ballots are still being counted, and can be run by hand.
+# Scheduled runs write unofficial counts. Mark results certified by hand with the "certified"
+# box once the state certifies. The schedule stops on its own after the end date below.
 on:
+  schedule:
+    - cron: "41 2 * * *"
   workflow_dispatch:
     inputs:
       date:
@@ -42,12 +46,18 @@ jobs:
       - uses: ./.github/actions/setup
       - name: Official results
         env:
-          ELECTION_DATE: ${{ inputs.date }}
-          DRY_RUN: ${{ inputs.dry_run }}
-          CERTIFIED: ${{ inputs.certified }}
-          DISCOVER: ${{ inputs.discover }}
-          FILE_URL: ${{ inputs.file_url }}
+          # Scheduled runs have no inputs, so these defaults apply: general election, real write.
+          ELECTION_DATE: ${{ inputs.date || '20261103' }}
+          DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run || 'false' }}
+          CERTIFIED: ${{ inputs.certified || 'false' }}
+          DISCOVER: ${{ inputs.discover || 'false' }}
+          FILE_URL: ${{ inputs.file_url || '' }}
         run: |
+          # Scheduled runs stop after 2026-12-31 (certification is done by then).
+          if [ "${{ github.event_name }}" = "schedule" ] && [ "$(date -u +%Y%m%d)" -gt 20261231 ]; then
+            echo "Past the end date for scheduled runs, nothing to do."
+            exit 0
+          fi
           args=(--date "$ELECTION_DATE")
           if [ "$DISCOVER" = "true" ]; then args+=(--discover); fi
           if [ -n "$FILE_URL" ]; then args+=(--file "$FILE_URL"); fi
