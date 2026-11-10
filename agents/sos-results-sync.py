@@ -340,7 +340,7 @@ def apply(contests: list[dict], election_date: str, certified: bool, dry_run: bo
     wa = db.table("states").select("id").eq("abbreviation", "WA").single().execute().data["id"]
     elections = (
         db.table("elections")
-        .select("id,office_name,election_date,level,county_id,municipality_id")
+        .select("id,office_name,election_date,level,county_id,municipality_id,results_status")
         .eq("election_date", election_date)
         .execute()
         .data
@@ -399,9 +399,11 @@ def apply(contests: list[dict], election_date: str, certified: bool, dry_run: bo
             election_id = matches[0]["id"]
             stats["elections_matched"] += 1
             log.info("MATCH   %-52s -> %s", c["office_name"], matches[0]["office_name"])
+            # Never take a certified race back to unofficial.
+            keep = "certified" if matches[0].get("results_status") == "certified" else status
             if not dry_run:
                 db.table("elections").update(
-                    {"results_status": status, "results_updated_at": now, "seats": c["seats"]}
+                    {"results_status": keep, "results_updated_at": now, "seats": c["seats"]}
                 ).eq("id", election_id).execute()
         else:
             stats["elections_created"] += 1
