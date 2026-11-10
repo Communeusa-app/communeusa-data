@@ -9,6 +9,14 @@ on:
         description: "Election date as YYYYMMDD (general election: 20261103)"
         required: true
         default: "20261103"
+      discover:
+        description: "Only list the results pages and files the state site offers (writes nothing)"
+        type: boolean
+        default: false
+      file_url:
+        description: "Optional: full address of a results CSV, if the default address is not found"
+        required: false
+        default: ""
       dry_run:
         description: "Print what would change without writing"
         type: boolean
@@ -37,8 +45,12 @@ jobs:
           ELECTION_DATE: ${{ inputs.date }}
           DRY_RUN: ${{ inputs.dry_run }}
           CERTIFIED: ${{ inputs.certified }}
+          DISCOVER: ${{ inputs.discover }}
+          FILE_URL: ${{ inputs.file_url }}
         run: |
           args=(--date "$ELECTION_DATE")
+          if [ "$DISCOVER" = "true" ]; then args+=(--discover); fi
+          if [ -n "$FILE_URL" ]; then args+=(--file "$FILE_URL"); fi
           if [ "$DRY_RUN" = "true" ]; then args+=(--dry-run); fi
           if [ "$CERTIFIED" = "true" ]; then args+=(--certified); fi
           python agents/sos-results-sync.py "${args[@]}"
