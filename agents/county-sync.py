@@ -148,6 +148,56 @@ def base_title(title: str) -> str:
     return re.sub(r"\s*\(.*?\)", "", title or "").strip().lower()
 
 
+WSAC_DIRECTORY = "https://wsac.org/member-directory/"
+BOARD_TITLE = re.compile(r"commissioner|council|executive|chair", re.I)
+
+
+def board_covers(title: str) -> bool:
+    """Offices the WSAC directory is responsible for (including old chair rows)."""
+    return bool(BOARD_TITLE.search(title or ""))
+
+
+def fetch_board_page() -> str:
+    resp = requests.get(WSAC_DIRECTORY, headers=HEADERS, timeout=30)
+    resp.raise_for_status()
+    return resp.text
+
+
+def parse_board(html: str) -> list[dict]:
+    """
+    Parse the WSAC member directory: one table row per county commissioner, councilmember or
+    county executive with columns County, District, Title, First Name, Last Name.
+    """
+    soup = BeautifulSoup(html, "html.parser")
+    results: list[dict] = []
+    for tr in soup.select("table tbody tr"):
+        cells = [clean(td.get_text(" ", strip=True)) for td in tr.find_all("td")]
+        if len(cells) < 5 or not cells[0] or not cells[0].endswith(" County"):
+            continue
+        county, _district, raw_title, first, last = cells[:5]
+        if not first or not last:
+            continue
+        m = re.match(r"^\S+\s*\((.+)\)$", first)      # 'Charles (Chuck)' -> 'Chuck'
+        first = m.group(1) if m else first
+        low = (raw_title or "").lower()
+        if "executive" in low and "pro" not in low:
+            title = "County Executive"
+        elif "commissioner" in low:
+            title = "County Commissioner"
+        elif "council" in low:
+            title = "County Councilmember"
+        else:
+            continue
+        results.append({
+            "county_name": strip_county_suffix(county),
+            "official_name": re.sub(r"\s+", " ", f"{first} {last}").strip(),
+            "office_title": title, "phone": None, "email": None,
+        })
+    log.info("Parsed %d county board members across %d counties (WSAC)",
+             len(results), len({r["county_name"] for r in results}))
+    return results
+
+
 NEW_DIRECTORY = "https://www.countyofficials.org/m/directory/department?did=193"
 
 
@@ -306,9 +356,14 @@ def sync_county_officials(
     wa_id: str,
     county_map: dict[str, str],
     incoming: list[dict],
+    covers=None,
+    source: str = "source page",
 ) -> None:
     """
     Reconcile scraped officials against the DB.
+
+    `covers(office_title) -> bool` says which offices this source is responsible for. Only
+    those can be flagged inactive. Default: the offices that appear in `incoming`.
 
     - INSERT   rows not in DB
     - UPDATE   rows where phone, email, official_name, or office_title changed
@@ -319,13 +374,16 @@ def sync_county_officials(
 
     # Guardrail: a broken or blocked source page parses as "no officials". Without this check
     # the sync would mark every county official inactive (it did, on 2026-11-08).
-    active_now = sum(1 for r in existing.values() if r.get("is_active", True))
+    if covers is None:
+        covered_titles = {base_title(r["office_title"]) for r in incoming}
+        covers = lambda title: base_title(title) in covered_titles   # noqa: E731
+    active_now = sum(1 for k, r in existing.items() if r.get("is_active", True) and covers(k[1]))
     if not incoming:
-        sys.exit("ERROR: the source page returned 0 county officials. Not changing anything. "
+        sys.exit(f"ERROR: {source} returned 0 county officials. Not changing anything. "
                  "The page layout may have changed or the site may be blocking this runner.")
     if active_now and len(incoming) < 0.7 * active_now:
-        sys.exit(f"ERROR: the source page returned only {len(incoming)} county officials but "
-                 f"{active_now} are active in the database. Not changing anything.")
+        sys.exit(f"ERROR: {source} returned only {len(incoming)} county officials but "
+                 f"{active_now} are active in the database for those offices. Not changing anything.")
 
     # Build incoming lookup, skipping officials whose county isn't in the DB
     incoming_keyed: dict[tuple, dict] = {}
@@ -345,10 +403,6 @@ def sync_county_officials(
             "Skipped officials for counties not found in DB: %s",
             ", ".join(sorted(skipped_counties))
         )
-
-    # The source only lists some offices (the elected row officers). Never flag anyone inactive
-    # for an office the source does not cover, such as commissioners or councilmembers.
-    covered_titles = {base_title(r["office_title"]) for r in incoming}
 
     inserted = updated = flagged = 0
 
@@ -393,7 +447,7 @@ def sync_county_officials(
     # ── FLAG INACTIVE ─────────────────────────────────────────────────────────
     for key, db_row in existing.items():
         if key not in incoming_keyed and db_row.get("is_active", True) \
-                and base_title(key[1]) in covered_titles:
+                and covers(key[1]):
             supabase.table("officials").update({"is_active": False}).eq("id", db_row["id"]).execute()
             official_name, office_title, _ = key
             log.info("[%s] INACTIVE county  %s  —  %s", now, official_name, office_title)
@@ -430,7 +484,11 @@ def main() -> None:
     html      = fetch_officials_page()
     officials = parse_officials(html)
 
-    sync_county_officials(supabase, wa_id, county_map, officials)
+    sync_county_officials(supabase, wa_id, county_map, officials, source="the WACO directory")
+
+    board = parse_board(fetch_board_page())
+    sync_county_officials(supabase, wa_id, county_map, board, covers=board_covers,
+                          source="the WSAC directory")
 
     log.info("=== county-sync complete ===")
 
