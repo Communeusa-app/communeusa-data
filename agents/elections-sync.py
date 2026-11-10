@@ -901,6 +901,25 @@ def load_existing_candidates(supabase: Client) -> set[tuple]:
     }
 
 
+def load_verified_election_ids(supabase: Client) -> set[str]:
+    """Election ids that already have candidates verified against official results."""
+    ids: set[str] = set()
+    start = 0
+    while True:
+        res = (
+            supabase.table("candidates")
+            .select("election_id")
+            .eq("status", "verified")
+            .range(start, start + 999)
+            .execute()
+        )
+        rows = res.data or []
+        ids.update(r["election_id"] for r in rows)
+        if len(rows) < 1000:
+            return ids
+        start += 1000
+
+
 def load_existing_positions(supabase: Client) -> set[tuple]:
     """Return {(candidate_id, issue_area)} for dedup."""
     res = supabase.table("candidate_positions").select("candidate_id,issue_area").execute()
@@ -986,6 +1005,11 @@ def upsert_election(
     key = (office_name, election_date, county_id, municipality_id)
     if key in existing:
         return existing[key]
+
+    # Races are created by sos-results-sync from the official results. This scraper
+    # stamps one hardcoded date on every race, so it no longer creates new ones.
+    log.debug("[%s] SKIP unknown race (not in official results): %s", now, office_name)
+    return None
 
     primary_date    = ELECTION_DATE_PRIMARY
     filing_deadline = FILING_DEADLINE
@@ -1114,6 +1138,7 @@ def main() -> None:
     official_lookup  = build_official_lookup(supabase)
     existing_elecs   = load_existing_elections(supabase)
     existing_cands   = load_existing_candidates(supabase)
+    verified_elecs   = load_verified_election_ids(supabase)
     existing_pos     = load_existing_positions(supabase)
 
     log.info(
@@ -1176,6 +1201,12 @@ def main() -> None:
         # Skip elections already fully processed in a prior run
         if election_id in completed_election_ids:
             log.debug("SKIP (checkpoint): %s", office_name)
+            continue
+
+        # Official results are the source of truth: never add scraped candidates to a
+        # race that already has verified ones.
+        if election_id in verified_elecs:
+            log.debug("SKIP (verified results exist): %s", office_name)
             continue
 
         # Upsert candidates
