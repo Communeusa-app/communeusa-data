@@ -238,6 +238,16 @@ def sync_county_officials(
     existing = get_existing_county_officials(supabase)
     now = ts()
 
+    # Guardrail: a broken or blocked source page parses as "no officials". Without this check
+    # the sync would mark every county official inactive (it did, on 2026-11-08).
+    active_now = sum(1 for r in existing.values() if r.get("is_active", True))
+    if not incoming:
+        sys.exit("ERROR: the source page returned 0 county officials. Not changing anything. "
+                 "The page layout may have changed or the site may be blocking this runner.")
+    if active_now and len(incoming) < 0.7 * active_now:
+        sys.exit(f"ERROR: the source page returned only {len(incoming)} county officials but "
+                 f"{active_now} are active in the database. Not changing anything.")
+
     # Build incoming lookup, skipping officials whose county isn't in the DB
     incoming_keyed: dict[tuple, dict] = {}
     skipped_counties: set[str] = set()
