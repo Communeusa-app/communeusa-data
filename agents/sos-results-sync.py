@@ -91,6 +91,48 @@ def title_case(text: str) -> str:
     return "".join(out)
 
 
+COUNTY_OFFICES = [
+    (r"director of elections", "Director of Elections"),
+    (r"assessor", "Assessor"),
+    (r"auditor", "Auditor"),
+    (r"\bclerk\b", "Clerk"),
+    (r"coroner|medical examiner", "Coroner"),
+    (r"prosecut|pros\.? atty", "Prosecuting Attorney"),
+    (r"sheriff", "Sheriff"),
+    (r"treasurer", "Treasurer"),
+    (r"county executive|\bexecutive\b", "Executive"),
+]
+COUNTY_BOARD = r"(commissioner|councilor|council)"
+# Contests that are not county offices (courts, special districts, cities). Not handled yet.
+COUNTY_EXCLUDE = re.compile(
+    r"court|judge|judicial|utility|\bpud\b|fire|port\b|school|hospital|cemetery|water|sewer|"
+    r"library|park|city of|municipal|town of|levy|bond|measure|proposition|charter|\bcity\b",
+    re.I,
+)
+
+
+def county_office(text: str) -> Optional[tuple]:
+    """Return (office, number) for a county office such as ('Sheriff', None) or ('Commissioner', 3)."""
+    low = re.sub(r"\s+", " ", (text or "").lower())
+    if COUNTY_EXCLUDE.search(low):
+        return None
+    m = re.search(COUNTY_BOARD, low)
+    if m:
+        n = re.search(r"(?:district|dist\.?|no\.?|position|pos\.?)\s*#?\s*(\d+)", low)
+        office = "Council" if m.group(1) in ("council", "councilor") else "Commissioner"
+        return (office, int(n.group(1)) if n else None)
+    for pattern, label in COUNTY_OFFICES:
+        if re.search(pattern, low):
+            return (label, None)
+    return None
+
+
+def county_name_of(jurisdiction: str) -> Optional[str]:
+    j = re.sub(r"\s+", " ", (jurisdiction or "").strip())
+    m = re.match(r"(.+?) county$", j, re.I)
+    return m.group(1).strip() if m else None
+
+
 def parse_contest(race: str, jurisdiction: str) -> Optional[dict]:
     """
     Turn a Secretary of State contest label into {kind, district, position, office_name, level}.
@@ -120,6 +162,16 @@ def parse_contest(race: str, jurisdiction: str) -> Optional[dict]:
     if re.match(r"(united states|u\.?s\.?) senator", low):
         return dict(kind="ussenate", district=None, position=None, level="federal",
                     office_name="U.S. Senate Washington")
+
+    county = county_name_of(jurisdiction)
+    if county:
+        office = county_office(r)
+        if office is None:
+            return None
+        label, num = office
+        title = f"{label} District {num}" if num else label
+        return dict(kind="county", district=num, position=None, level="county", county=county,
+                    office=label, office_name=f"{county} County {title}")
 
     if jurisdiction.strip().lower() == "judicial" or re.match(
         r"(supreme court|court of appeals|superior court)", low
@@ -213,6 +265,24 @@ def rows_from_json(data: dict) -> list[dict]:
                 "JurisdictionName": "",
                 "VoteFor": item.get("voteFor") or 1,
             })
+    for jur in data.get("localResults") or []:
+        county = jur.get("name") or ""
+        for item in jur.get("ballotItems") or []:
+            if item.get("type") != "Local" or item.get("contestType") != "Candidate":
+                continue
+            options = item.get("ballotOptions") or []
+            total = sum(int(o.get("voteCount") or 0) for o in options)
+            for o in options:
+                votes = int(o.get("voteCount") or 0)
+                rows.append({
+                    "Race": item.get("name") or "",
+                    "Candidate": o.get("name") or "",
+                    "Party": o.get("politicalParty") or "",
+                    "Votes": votes,
+                    "PercentageOfTotalVotes": round(100.0 * votes / total, 2) if total else 0,
+                    "JurisdictionName": county,
+                    "VoteFor": item.get("voteFor") or 1,
+                })
     return rows
 
 
@@ -253,9 +323,17 @@ def apply(contests: list[dict], election_date: str, certified: bool, dry_run: bo
         .data
         or []
     )
+    counties = db.table("counties").select("id,name").eq("state_id", wa).execute().data or []
+    county_ids = {re.sub(r"\s+county$", "", c["name"], flags=re.I).strip().lower(): c["id"] for c in counties}
     by_key: dict[tuple, list[dict]] = {}
+    by_county: dict[tuple, list[dict]] = {}
     for e in elections:
-        if e.get("county_id") or e.get("municipality_id"):
+        if e.get("municipality_id"):
+            continue
+        if e.get("county_id"):
+            off = county_office(e["office_name"])
+            if off:
+                by_county.setdefault((e["county_id"], off), []).append(e)
             continue
         by_key.setdefault(parse_existing_name(e["office_name"]), []).append(e)
 
@@ -264,9 +342,20 @@ def apply(contests: list[dict], election_date: str, certified: bool, dry_run: bo
     stats = dict(elections_matched=0, elections_created=0, cand_updated=0, cand_inserted=0, ambiguous=0)
 
     for c in contests:
+        county_id = None
+        if c["kind"] == "county":
+            county_id = county_ids.get(c["county"].lower())
+            if not county_id:
+                log.warning("County not found in database, skipping: %s", c["office_name"])
+                stats["ambiguous"] += 1
+                continue
+            matches = by_county.get((county_id, (c["office"], c["district"])), [])
+        else:
+            matches = None
         k = (c["kind"], c["district"], c["position"]) if c["kind"] != "judicial" else (
             "name", re.sub(r"[^a-z0-9]+", " ", c["office_name"].lower()).strip(), None)
-        matches = by_key.get(k, [])
+        if matches is None:
+            matches = by_key.get(k, [])
         if len(matches) > 1:
             log.warning("AMBIGUOUS, skipping: %s matches %d existing races", c["office_name"], len(matches))
             stats["ambiguous"] += 1
@@ -285,7 +374,7 @@ def apply(contests: list[dict], election_date: str, certified: bool, dry_run: bo
             election_id = None
             if not dry_run:
               res = db.table("elections").insert({
-                "state_id": wa, "office_name": c["office_name"], "level": c["level"],
+                "state_id": wa, "county_id": county_id, "office_name": c["office_name"], "level": c["level"],
                 "election_date": election_date, "source_url": "https://results.vote.wa.gov",
                 "results_status": status, "results_updated_at": now, "seats": c["seats"],
               }).execute()
