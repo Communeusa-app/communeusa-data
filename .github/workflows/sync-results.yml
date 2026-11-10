@@ -1,0 +1,44 @@
+name: Sync official results
+
+# Candidates and vote counts from the WA Secretary of State results export.
+# Manual for now: run it after election night and again after certification.
+on:
+  workflow_dispatch:
+    inputs:
+      date:
+        description: "Election date as YYYYMMDD (general election: 20261103)"
+        required: true
+        default: "20261103"
+      dry_run:
+        description: "Print what would change without writing"
+        type: boolean
+        default: true
+      certified:
+        description: "Mark results as certified (only after the state certifies)"
+        type: boolean
+        default: false
+
+concurrency:
+  group: sync-results
+  cancel-in-progress: false
+
+jobs:
+  results:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup
+      - name: Official results
+        env:
+          ELECTION_DATE: ${{ inputs.date }}
+          DRY_RUN: ${{ inputs.dry_run }}
+          CERTIFIED: ${{ inputs.certified }}
+        run: |
+          args=(--date "$ELECTION_DATE")
+          if [ "$DRY_RUN" = "true" ]; then args+=(--dry-run); fi
+          if [ "$CERTIFIED" = "true" ]; then args+=(--certified); fi
+          python agents/sos-results-sync.py "${args[@]}"
