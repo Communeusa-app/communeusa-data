@@ -19,7 +19,8 @@ end $$;
 
 alter table elections
   add column if not exists results_status     text,
-  add column if not exists results_updated_at timestamptz;
+  add column if not exists results_updated_at timestamptz,
+  add column if not exists seats              integer;
 
 do $$
 begin
@@ -35,4 +36,5 @@ comment on column candidates.source is
 comment on column candidates.status is
   'verified = confirmed against official results; unverified = not yet confirmed. The site shows only verified candidates.';
 comment on column candidates.votes is 'Votes counted so far (unofficial until the election is certified).';
+comment on column elections.seats is 'How many candidates are elected in this race (1 for most races).';
 comment on column elections.results_status is 'unofficial while counting, certified once the state certifies results.';
