@@ -29,6 +29,10 @@ on:
         description: "Mark results as certified (only after the state certifies)"
         type: boolean
         default: false
+      certify_recent:
+        description: "Allow certifying an election less than 30 days old (only if the state has certified)"
+        type: boolean
+        default: false
 
 concurrency:
   group: sync-results
@@ -50,6 +54,7 @@ jobs:
           ELECTION_DATE: ${{ inputs.date || '20261103' }}
           DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run || 'false' }}
           CERTIFIED: ${{ inputs.certified || 'false' }}
+          CERTIFY_RECENT: ${{ inputs.certify_recent || 'false' }}
           DISCOVER: ${{ inputs.discover || 'false' }}
           FILE_URL: ${{ inputs.file_url || '' }}
         run: |
@@ -65,5 +70,6 @@ jobs:
             if [ -n "$FILE_URL" ]; then args+=(--file "$FILE_URL"); fi
             if [ "$DRY_RUN" = "true" ]; then args+=(--dry-run); fi
             if [ "$CERTIFIED" = "true" ]; then args+=(--certified); fi
+            if [ "$CERTIFY_RECENT" = "true" ]; then args+=(--certify-recent); fi
             python agents/sos-results-sync.py "${args[@]}"
           done

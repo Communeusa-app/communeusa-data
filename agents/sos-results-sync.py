@@ -148,7 +148,7 @@ def city_contest(race: str) -> Optional[dict]:
                     office_name=f"{city} City Council District {n}")
     m = re.match(r"(.+?) municipal court - (?:judge )?position no\.? ?(\d+)$", race, re.I)
     if m:
-        city, n = m.group(1).strip(), int(m.group(2))
+        city, n = re.sub(r"^city of ", "", m.group(1).strip(), flags=re.I), int(m.group(2))
         return dict(kind="city", district=None, position=n, level="city", city=city,
                     office_name=f"{city} Municipal Court Judge Position {n}")
     return None
@@ -543,6 +543,8 @@ def main() -> None:
     ap.add_argument("--parse-only", action="store_true", help="Parse the files and print contests; no database access")
     ap.add_argument("--discover", action="store_true", help="List the results pages and export files the state site offers for --date, then exit")
     ap.add_argument("--certified", action="store_true", help="Mark results as certified (default: unofficial)")
+    ap.add_argument("--certify-recent", action="store_true",
+                    help="Allow --certified for an election less than 30 days old (normally refused)")
     args = ap.parse_args()
 
     if not args.date and not args.file:
@@ -594,6 +596,12 @@ def main() -> None:
         election_date = f"{d[0:4]}-{d[4:6]}-{d[6:8]}"
     else:
         sys.exit("ERROR: database updates need --date so races get the right election date")
+    if args.certified and not args.certify_recent:
+        age = (datetime.now(timezone.utc).date() - datetime.strptime(election_date, "%Y-%m-%d").date()).days
+        if age < 30:
+            sys.exit(f"ERROR: {election_date} is only {age} days old. Washington certifies results about "
+                     "4 weeks after an election, and certifying early would label counted-in-progress "
+                     "results as final. Use --certify-recent if the state has already certified.")
     apply(contests, election_date, args.certified, args.dry_run)
 
 
