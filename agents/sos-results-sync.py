@@ -50,6 +50,7 @@ log = logging.getLogger("sos-results-sync")
 
 JSON_URL = "https://results.votewa.gov/cdn/results/washington/export-{date}.json"
 CSV_URL = "https://results.vote.wa.gov/results/{date}/export/{date}_AllState.csv"
+COUNTIES_URL = "https://results.vote.wa.gov/results/{date}/export/{date}_AllCounties.csv"
 MEASURE_WORDS = {"approved", "rejected", "yes", "no", "for", "against", "maintained", "repealed"}
 
 
@@ -121,7 +122,9 @@ def county_office(text: str, county: Optional[str] = None) -> Optional[tuple]:
         return None
     m = re.search(COUNTY_BOARD, low)
     if m:
-        n = re.search(r"(?:district|dist\.?|no\.?|position|pos\.?)\s*#?\s*(\d+)", low)
+        n = re.search(r"(?:district|dist\.?|no\.?|position|pos\.?|commissioner|councilor)\s*#?\s*(\d+)", low)
+        if not n and re.search(r"at[- ]large", low):
+            return None  # at-large seats are lettered; not handled yet
         office = "Council" if m.group(1) in ("council", "councilor") else "Commissioner"
         if office == "Council" and "county" not in low and county \
                 and county.lower() not in COUNTY_COUNCIL_COUNTIES:
@@ -139,6 +142,46 @@ def county_name_of(jurisdiction: str) -> Optional[str]:
     return m.group(1).strip() if m else None
 
 
+def generic_city_contest(race: str) -> Optional[dict]:
+    """City and town offices as named in the county result files ('CITY OF OTHELLO Council Position 2')."""
+    m = re.match(r"(?:city|town) of (.+)$", race, re.I)
+    if not m:
+        return None
+    rest = m.group(1)
+    kw = re.search(r"\b(mayor|council ?member|councilmember|council|municipal court)\b", rest, re.I)
+    if not kw or re.search(r"proposition|levy|bond|measure|district no\. ?\d+ proposition", rest, re.I):
+        return None
+    name = rest[: kw.start()].strip()
+    name = re.sub(r"\s+(?:district|ward|dist\.?)\s*\d+$", "", name, flags=re.I).strip()
+    words = name.split()
+    if len(words) >= 2 and len(words) % 2 == 0 and words[: len(words) // 2] == words[len(words) // 2:]:
+        name = " ".join(words[: len(words) // 2])
+    elif len(words) >= 2 and words[-1].lower() == words[0].lower():
+        name = " ".join(words[:-1])
+    if not name:
+        return None
+    city = title_case(name)
+    tail = rest[kw.start():]
+    kind_word = kw.group(1).lower()
+    if kind_word == "mayor":
+        return dict(kind="city", district=None, position=None, level="city", city=city,
+                    office_name=f"{city} Mayor")
+    if kind_word == "municipal court":
+        n = re.search(r"(\d+)\s*$", tail)
+        if not n:
+            return None
+        return dict(kind="city", district=None, position=int(n.group(1)), level="city", city=city,
+                    office_name=f"{city} Municipal Court Judge Position {int(n.group(1))}")
+    label = re.sub(r"^(?:city )?council ?member|^councilmember|^council", "", tail, flags=re.I).strip()
+    label = re.sub(r"\bmember\b", "", label, flags=re.I)
+    label = re.sub(r"\b(?:position|pos\.?|no\.?)\s*", "Position ", label, flags=re.I)
+    label = re.sub(r"#\s*0*(\d+)", r"Position \1", label)
+    label = re.sub(r"\bposition\s+position\b", "Position", label, flags=re.I)
+    label = re.sub(r"\s+", " ", title_case(label)).strip()
+    return dict(kind="city", district=None, position=None, level="city", city=city,
+                office_name=f"{city} City Council {label}".strip())
+
+
 def city_contest(race: str) -> Optional[dict]:
     """City council seats and municipal court judges named like the state's local results."""
     m = re.match(r"city of (.+?) - council district no\.? ?(\d+)$", race, re.I)
@@ -146,6 +189,9 @@ def city_contest(race: str) -> Optional[dict]:
         city, n = m.group(1).strip(), int(m.group(2))
         return dict(kind="city", district=n, position=None, level="city", city=city,
                     office_name=f"{city} City Council District {n}")
+    generic = generic_city_contest(race)
+    if generic:
+        return generic
     m = re.match(r"(.+?) municipal court - (?:judge )?position no\.? ?(\d+)$", race, re.I)
     if m:
         city, n = re.sub(r"^city of ", "", m.group(1).strip(), flags=re.I), int(m.group(2))
@@ -292,6 +338,21 @@ def parse_rows(rows: list[dict]) -> list[dict]:
         })
     for race, n in skipped.items():
         log.info("Skipped (not handled yet): %s", race)
+    # A contest that spans counties appears once per county: add the pieces together.
+    for c in contests.values():
+        merged: dict[str, dict] = {}
+        for cand in c["candidates"]:
+            k = " ".join(name_key(cand["name"]))
+            if k in merged:
+                merged[k]["votes"] += cand["votes"]
+                merged[k]["_dup"] = True
+            else:
+                merged[k] = dict(cand)
+        if any(x.get("_dup") for x in merged.values()):
+            total = sum(x["votes"] for x in merged.values()) or 1
+            for x in merged.values():
+                x["vote_pct"] = round(100.0 * x["votes"] / total, 4)
+        c["candidates"] = [{k: v for k, v in x.items() if k != "_dup"} for x in merged.values()]
     return list(contests.values())
 
 
@@ -344,6 +405,19 @@ def rows_from_json(data: dict) -> list[dict]:
                     "VoteFor": item.get("voteFor") or 1,
                 })
     return rows
+
+
+def county_rows(rows: list[dict]) -> list[dict]:
+    """Keep county and city contests from an AllCounties file and label each with its county."""
+    out = []
+    for r in rows:
+        if (r.get("JurisdictionName") or "").strip() not in ("County", "City/Town"):
+            continue
+        county = (r.get("County") or "").strip()
+        if not county:
+            continue
+        out.append({**r, "JurisdictionName": f"{county} County"})
+    return out
 
 
 def read_source(src: str) -> list[dict]:
@@ -411,6 +485,13 @@ def apply(contests: list[dict], election_date: str, certified: bool, dry_run: bo
         municipality_id = None
         if c["kind"] == "city":
             municipality_id = city_ids.get(c["city"].lower())
+            if not municipality_id and c["city"].lower().endswith(" city"):
+                # 'ASOTIN CITY COUNCIL ...' is read as city 'Asotin City'; try without the trailing word.
+                short = c["city"][: -len(" city")]
+                municipality_id = city_ids.get(short.lower())
+                if municipality_id:
+                    c["office_name"] = c["office_name"].replace(c["city"], short, 1)
+                    c["city"] = short
             if not municipality_id:
                 log.warning("City not found in database, skipping: %s", c["office_name"])
                 stats["ambiguous"] += 1
@@ -573,6 +654,13 @@ def main() -> None:
             log.info("Reading %s", src)
             try:
                 rows = read_source(src)
+                if src == CSV_URL.format(date=args.date):
+                    try:
+                        extra = county_rows(read_source(COUNTIES_URL.format(date=args.date)))
+                        log.info("Added %d county and city rows", len(extra))
+                        rows += extra
+                    except NotFound:
+                        log.warning("No county file for this date")
                 break
             except NotFound:
                 log.warning("Not found: %s", src)
