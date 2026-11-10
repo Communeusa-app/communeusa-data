@@ -103,6 +103,8 @@ COUNTY_OFFICES = [
     (r"county executive|\bexecutive\b", "Executive"),
 ]
 COUNTY_BOARD = r"(commissioner|councilor|council)"
+# Counties governed by a council. Elsewhere a bare "Council" contest is a city or town seat.
+COUNTY_COUNCIL_COUNTIES = {"king", "pierce", "snohomish", "clark", "whatcom", "san juan"}
 # Contests that are not county offices (courts, special districts, cities). Not handled yet.
 COUNTY_EXCLUDE = re.compile(
     r"court|judge|judicial|utility|\bpud\b|fire|port\b|school|hospital|cemetery|water|sewer|"
@@ -111,7 +113,7 @@ COUNTY_EXCLUDE = re.compile(
 )
 
 
-def county_office(text: str) -> Optional[tuple]:
+def county_office(text: str, county: Optional[str] = None) -> Optional[tuple]:
     """Return (office, number) for a county office such as ('Sheriff', None) or ('Commissioner', 3)."""
     low = re.sub(r"\s+", " ", (text or "").lower())
     if COUNTY_EXCLUDE.search(low):
@@ -120,6 +122,9 @@ def county_office(text: str) -> Optional[tuple]:
     if m:
         n = re.search(r"(?:district|dist\.?|no\.?|position|pos\.?)\s*#?\s*(\d+)", low)
         office = "Council" if m.group(1) in ("council", "councilor") else "Commissioner"
+        if office == "Council" and "county" not in low and county \
+                and county.lower() not in COUNTY_COUNCIL_COUNTIES:
+            return None
         return (office, int(n.group(1)) if n else None)
     for pattern, label in COUNTY_OFFICES:
         if re.search(pattern, low):
@@ -131,6 +136,21 @@ def county_name_of(jurisdiction: str) -> Optional[str]:
     j = re.sub(r"\s+", " ", (jurisdiction or "").strip())
     m = re.match(r"(.+?) county$", j, re.I)
     return m.group(1).strip() if m else None
+
+
+def city_contest(race: str) -> Optional[dict]:
+    """City council seats and municipal court judges named like the state's local results."""
+    m = re.match(r"city of (.+?) - council district no\.? ?(\d+)$", race, re.I)
+    if m:
+        city, n = m.group(1).strip(), int(m.group(2))
+        return dict(kind="city", district=n, position=None, level="city", city=city,
+                    office_name=f"{city} City Council District {n}")
+    m = re.match(r"(.+?) municipal court - (?:judge )?position no\.? ?(\d+)$", race, re.I)
+    if m:
+        city, n = m.group(1).strip(), int(m.group(2))
+        return dict(kind="city", district=None, position=n, level="city", city=city,
+                    office_name=f"{city} Municipal Court Judge Position {n}")
+    return None
 
 
 def parse_contest(race: str, jurisdiction: str) -> Optional[dict]:
@@ -165,7 +185,10 @@ def parse_contest(race: str, jurisdiction: str) -> Optional[dict]:
 
     county = county_name_of(jurisdiction)
     if county:
-        office = county_office(r)
+        city = city_contest(r)
+        if city:
+            return city
+        office = county_office(r, county)
         if office is None:
             return None
         label, num = office
@@ -325,13 +348,17 @@ def apply(contests: list[dict], election_date: str, certified: bool, dry_run: bo
     )
     counties = db.table("counties").select("id,name").eq("state_id", wa).execute().data or []
     county_ids = {re.sub(r"\s+county$", "", c["name"], flags=re.I).strip().lower(): c["id"] for c in counties}
+    cities = db.table("municipalities").select("id,name").eq("state_id", wa).execute().data or []
+    city_ids = {c["name"].strip().lower(): c["id"] for c in cities}
+    by_city: dict[tuple, list[dict]] = {}
     by_key: dict[tuple, list[dict]] = {}
     by_county: dict[tuple, list[dict]] = {}
     for e in elections:
         if e.get("municipality_id"):
+            by_city.setdefault((e["municipality_id"], re.sub(r"[^a-z0-9]+", " ", e["office_name"].lower()).strip()), []).append(e)
             continue
         if e.get("county_id"):
-            off = county_office(e["office_name"])
+            off = county_office(e["office_name"], "king")  # existing rows: accept council seats in any county
             if off:
                 by_county.setdefault((e["county_id"], off), []).append(e)
             continue
@@ -343,7 +370,15 @@ def apply(contests: list[dict], election_date: str, certified: bool, dry_run: bo
 
     for c in contests:
         county_id = None
-        if c["kind"] == "county":
+        municipality_id = None
+        if c["kind"] == "city":
+            municipality_id = city_ids.get(c["city"].lower())
+            if not municipality_id:
+                log.warning("City not found in database, skipping: %s", c["office_name"])
+                stats["ambiguous"] += 1
+                continue
+            matches = by_city.get((municipality_id, re.sub(r"[^a-z0-9]+", " ", c["office_name"].lower()).strip()), [])
+        elif c["kind"] == "county":
             county_id = county_ids.get(c["county"].lower())
             if not county_id:
                 log.warning("County not found in database, skipping: %s", c["office_name"])
@@ -374,7 +409,7 @@ def apply(contests: list[dict], election_date: str, certified: bool, dry_run: bo
             election_id = None
             if not dry_run:
               res = db.table("elections").insert({
-                "state_id": wa, "county_id": county_id, "office_name": c["office_name"], "level": c["level"],
+                "state_id": wa, "county_id": county_id, "municipality_id": municipality_id, "office_name": c["office_name"], "level": c["level"],
                 "election_date": election_date, "source_url": "https://results.vote.wa.gov",
                 "results_status": status, "results_updated_at": now, "seats": c["seats"],
               }).execute()
