@@ -189,6 +189,11 @@ def city_contest(race: str) -> Optional[dict]:
         city, n = m.group(1).strip(), int(m.group(2))
         return dict(kind="city", district=n, position=None, level="city", city=city,
                     office_name=f"{city} City Council District {n}")
+    m = re.match(r"(.+?) - city council ?,? ?(?:district|dist\.?) ?(?:no\.? ?)?(\d+)$", race, re.I)
+    if m:
+        city, n = re.sub(r"^(?:city|town) of ", "", m.group(1).strip(), flags=re.I), int(m.group(2))
+        return dict(kind="city", district=n, position=None, level="city", city=city,
+                    office_name=f"{city} City Council District {n}")
     generic = generic_city_contest(race)
     if generic:
         return generic
