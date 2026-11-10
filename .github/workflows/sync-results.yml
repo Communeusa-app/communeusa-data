@@ -10,7 +10,7 @@ on:
   workflow_dispatch:
     inputs:
       date:
-        description: "Election date as YYYYMMDD (general election: 20261103)"
+        description: "Election date as YYYYMMDD (general election: 20261103). Several dates can be separated by commas, for example 20220802,20221108"
         required: true
         default: "20261103"
       discover:
@@ -58,9 +58,12 @@ jobs:
             echo "Past the end date for scheduled runs, nothing to do."
             exit 0
           fi
-          args=(--date "$ELECTION_DATE")
-          if [ "$DISCOVER" = "true" ]; then args+=(--discover); fi
-          if [ -n "$FILE_URL" ]; then args+=(--file "$FILE_URL"); fi
-          if [ "$DRY_RUN" = "true" ]; then args+=(--dry-run); fi
-          if [ "$CERTIFIED" = "true" ]; then args+=(--certified); fi
-          python agents/sos-results-sync.py "${args[@]}"
+          for d in ${ELECTION_DATE//,/ }; do
+            echo "=== Election $d ==="
+            args=(--date "$d")
+            if [ "$DISCOVER" = "true" ]; then args+=(--discover); fi
+            if [ -n "$FILE_URL" ]; then args+=(--file "$FILE_URL"); fi
+            if [ "$DRY_RUN" = "true" ]; then args+=(--dry-run); fi
+            if [ "$CERTIFIED" = "true" ]; then args+=(--certified); fi
+            python agents/sos-results-sync.py "${args[@]}"
+          done
