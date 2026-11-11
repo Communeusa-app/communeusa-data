@@ -539,7 +539,7 @@ def apply(contests: list[dict], election_date: str, certified: bool, dry_run: bo
             matches = by_county.get((county_id, (c["office"], c["district"])), [])
         else:
             matches = None
-        k = (c["kind"], c["district"], c["position"]) if c["kind"] not in ("judicial", "statewide") else (
+        k = (c["kind"], c["district"], c["position"]) if c["kind"] not in ("judicial", "statewide", "ussenate") else (
             "name", re.sub(r"[^a-z0-9]+", " ", c["office_name"].lower()).strip(), None)
         if matches is None:
             matches = by_key.get(k, [])

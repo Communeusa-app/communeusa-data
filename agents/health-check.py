@@ -45,6 +45,7 @@ def fetch_all(db, table: str, columns: str, **filters) -> list[dict]:
 class Report:
     def __init__(self) -> None:
         self.items: list[tuple[str, str, str]] = []  # (level, section, message)
+        self.details: list[str] = []
 
     def error(self, section: str, msg: str) -> None:
         self.items.append(("ERROR", section, msg))
@@ -66,6 +67,9 @@ class Report:
             out.append(f"\n## {level}\n")
             for _, section, msg in rows:
                 out.append(f"- [{section}] {msg}")
+        if self.details:
+            out.append("\n## Details\n")
+            out += self.details
         return "\n".join(out) + "\n"
 
 
@@ -77,7 +81,7 @@ def sample(names: list[str], n: int = 8) -> str:
 def check_officials(db, wa: str, rep: Report) -> None:
     officials = fetch_all(
         db, "officials",
-        "id,level,office_title,official_name,county_id,municipality_id,state_id,phone,email,official_website,is_active",
+        "id,level,office_title,official_name,district,county_id,municipality_id,state_id,phone,email,official_website,is_active,created_at,updated_at",
     )
     active = [o for o in officials if o.get("is_active")]
     by_level = Counter(o["level"] for o in active)
@@ -94,11 +98,19 @@ def check_officials(db, wa: str, rep: Report) -> None:
         rep.error("officials", f"{len(blank)} active officials have no name")
 
     seen: dict[tuple, int] = defaultdict(int)
+    groups: dict[tuple, list[dict]] = defaultdict(list)
     for o in active:
         key = (o["level"], (o["official_name"] or "").strip().lower(), (o["office_title"] or "").strip().lower(),
                o.get("county_id"), o.get("municipality_id"), o.get("state_id"))
         seen[key] += 1
+        groups[key].append(o)
     dups = [k for k, v in seen.items() if v > 1]
+    for k in dups[:12]:
+        for o in groups[k]:
+            rep.details.append(
+                f"- duplicate official: {o['official_name']} | {o['office_title']} | district={o.get('district')} "
+                f"| created={str(o.get('created_at'))[:19]} | updated={str(o.get('updated_at'))[:19]} | id={o['id']}"
+            )
     if dups:
         rep.error("officials", f"{len(dups)} duplicate active officials, e.g. " + sample([f"{k[1]} ({k[2]})" for k in dups]))
 
@@ -135,6 +147,13 @@ def check_elections(db, wa: str, rep: Report) -> None:
     keys = Counter((e["election_date"], e["office_name"].strip().lower(), e.get("county_id"), e.get("municipality_id"))
                    for e in elections)
     dups = [k for k, v in keys.items() if v > 1]
+    for k in dups[:12]:
+        for e in elections:
+            if (e["election_date"], e["office_name"].strip().lower(), e.get("county_id"), e.get("municipality_id")) == k:
+                rep.details.append(
+                    f"- duplicate race: {e['office_name']} {e['election_date']} | status={e.get('results_status')} "
+                    f"| candidates={len(by_election.get(e['id'], []))} | id={e['id']}"
+                )
     if dups:
         rep.error("elections", f"{len(dups)} duplicate races (same date, office and place), e.g. "
                   + sample([f"{k[1]} {k[0]}" for k in dups]))
@@ -165,8 +184,12 @@ def check_elections(db, wa: str, rep: Report) -> None:
                     count_off.append(f"{e['office_name']} ({adv} advanced)")
         if cs and (e.get("seats") or 1) == 1:
             total = sum(float(c.get("vote_pct") or 0) for c in cs)
-            if cs and total and not (90 <= total <= 100.6):
-                pct_off.append(f"{e['office_name']} ({total:.1f}%)")
+            # Write-ins are not stored, so small-town races can legitimately fall well under 100%.
+            if total > 100.6 or (total and total < 50):
+                pct_off.append(f"{e['office_name']} {e['election_date']} ({total:.1f}%)")
+                if len(pct_off) <= 10:
+                    rep.details.append(f"- vote shares {total:.1f}%: {e['office_name']} {e['election_date']} id={e['id']}: "
+                                       + "; ".join(f"{c['name']} {c.get('votes')} ({c.get('vote_pct')}%)" for c in cs))
     if certified_empty:
         rep.warn("results", f"{len(certified_empty)} certified races have no verified candidates: " + sample(certified_empty))
     if certified_no_outcome:
