@@ -24,6 +24,7 @@ Prerequisites:
 
 import json
 import logging
+import provenance
 import os
 import sys
 import time
@@ -311,6 +312,7 @@ def sync_city_officials(
                 "phone":           api_row["phone"],
                 "email":           api_row["email"],
                 "is_active":       True,
+                **provenance.fields("mrsc"),
             }
             supabase.table("officials").insert(payload).execute()
             log.info(
@@ -337,6 +339,8 @@ def sync_city_officials(
                 now, city_name, api_row["official_name"], changes,
             )
             updated += 1
+
+    provenance.stamp(supabase, [existing[k]["id"] for k in incoming if k in existing], "mrsc")
 
     # ── FLAG INACTIVE ─────────────────────────────────────────────────────────
     for key, db_row in existing.items():

@@ -17,6 +17,7 @@ Run:
 """
 
 import logging
+import provenance
 import os
 import sys
 import time
@@ -362,6 +363,7 @@ def sync_officials(
     """
     existing = get_existing_officials(supabase, level)
     incoming_by_name = {r["official_name"]: r for r in incoming if r.get("official_name")}
+    source_key = "openstates" if level == "state" else "congress"
 
     inserted = updated = flagged = 0
     now = ts()
@@ -381,6 +383,7 @@ def sync_officials(
                     "party", "district", "term_start", "term_end",
                     "phone", "email", "official_website",
                 )},
+                **provenance.fields(source_key),
             }
             supabase.table("officials").insert(payload).execute()
             log.info("[%s] INSERT  %-6s  %s  —  %s", now, level, name, api_row.get("office_title"))
@@ -403,6 +406,11 @@ def sync_officials(
             supabase.table("officials").update(changes).eq("id", db_row["id"]).execute()
             log.info("[%s] UPDATE  %-6s  %s  —  %s", now, level, name, changes)
             updated += 1
+
+    # Everyone the source still lists was just confirmed, changed or not.
+    confirmed = provenance.stamp(
+        supabase, [existing[n]["id"] for n in incoming_by_name if n in existing], source_key)
+    log.info("Stamped %d %s officials as verified against %s", confirmed, level, source_key)
 
     # ── FLAG INACTIVE ─────────────────────────────────────────────────────────
     for name, db_row in existing.items():

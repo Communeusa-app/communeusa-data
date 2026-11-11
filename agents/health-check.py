@@ -26,6 +26,7 @@ from supabase import create_client
 FLOORS = {"federal": 12, "state": 147, "county": 150, "city": 300}
 EXPECTED_WA_COUNTIES = 39
 STALE_AFTER_DAYS = 3        # unofficial results should be refreshed nightly while counting
+VERIFIED_WITHIN_DAYS = {"federal": 10, "state": 10, "county": 10, "city": 40}   # weekly syncs; city is monthly
 COUNTING_WINDOW_DAYS = 45   # how long after an election results are still expected to move
 
 
@@ -81,7 +82,7 @@ def sample(names: list[str], n: int = 8) -> str:
 def check_officials(db, wa: str, rep: Report) -> None:
     officials = fetch_all(
         db, "officials",
-        "id,level,office_title,official_name,district,county_id,municipality_id,state_id,phone,email,official_website,is_active,created_at,updated_at",
+        "id,level,office_title,official_name,district,county_id,municipality_id,state_id,phone,email,official_website,is_active,created_at,updated_at,source,last_verified_at",
     )
     active = [o for o in officials if o.get("is_active")]
     by_level = Counter(o["level"] for o in active)
@@ -120,6 +121,28 @@ def check_officials(db, wa: str, rep: Report) -> None:
             continue
         contact = sum(1 for o in rows if o.get("phone") or o.get("email") or o.get("official_website"))
         rep.info("officials", f"{level}: {round(100 * contact / len(rows))}% have a phone, email or website")
+
+    # Provenance: once the syncs have started stamping records, anything not confirmed lately is suspect.
+    stamped = [o for o in active if o.get("last_verified_at")]
+    if not stamped:
+        rep.info("freshness", "no official has been verified yet (provenance not rolled out)")
+    else:
+        for level in ("federal", "state", "county", "city"):
+            days = VERIFIED_WITHIN_DAYS[level]
+            cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+            rows = [o for o in active if o["level"] == level]
+            old_rows = [o for o in rows
+                        if not o.get("last_verified_at")
+                        or datetime.fromisoformat(o["last_verified_at"].replace("Z", "+00:00")) < cutoff]
+            if rows and old_rows:
+                msg = (f"{len(old_rows)} of {len(rows)} active {level} officials were not confirmed by their source "
+                       f"in the last {days} days")
+                (rep.error if len(old_rows) > 0.2 * len(rows) else rep.warn)("freshness", msg)
+                for o in old_rows[:5]:
+                    rep.details.append(f"- not verified recently: {o['official_name']} ({o['office_title']}) "
+                                       f"source={o.get('source')} last={o.get('last_verified_at')}")
+            elif rows:
+                rep.info("freshness", f"all {len(rows)} active {level} officials verified within {days} days")
 
     counties = fetch_all(db, "counties", "id,name", state_id=wa)
     if len(counties) != EXPECTED_WA_COUNTIES:
