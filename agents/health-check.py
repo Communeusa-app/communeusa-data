@@ -171,7 +171,11 @@ def check_elections(db, wa: str, rep: Report) -> None:
                 certified_empty.append(e["office_name"])
                 continue
             if not any(c.get("outcome") for c in cs):
-                certified_no_outcome.append(e["office_name"])
+                certified_no_outcome.append(f"{e['office_name']} {e['election_date']}")
+                if len(certified_no_outcome) <= 20:
+                    rep.details.append(f"- certified without won/advanced marks: {e['office_name']} {e['election_date']} "
+                                       f"({e.get('election_type')}) id={e['id']} candidates=" + ", ".join(
+                                           f"{c['name']} {c.get('votes')}" for c in cs))
                 continue
             seats = e.get("seats") or 1
             if e.get("election_type") == "general":

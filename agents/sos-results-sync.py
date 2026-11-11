@@ -135,6 +135,9 @@ def county_office(text: str, county: Optional[str] = None) -> Optional[tuple]:
     if COUNTY_EXCLUDE.search(low):
         return None
     m = re.search(COUNTY_BOARD, low)
+    if m and re.search(r"\b(?:pos\.?|position)\s*#?\s*\d", low) \
+            and not re.search(r"district|dist\.?|county|#\s*\d", low):
+        return None   # 'Commissioner Pos. 2' is a special district seat (the county's are 'District' or '#')
     if m:
         n = re.search(r"(?:district|dist\.?|no\.?|position|pos\.?|commissioner|councilor)\s*#?\s*(\d+)", low)
         if not n and re.search(r"at[- ]large", low):
