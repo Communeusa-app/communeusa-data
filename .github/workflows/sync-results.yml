@@ -48,6 +48,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/setup
+      - name: Inspect
+        run: python agents/sos-results-sync.py --date 20261103 --inspect 'Alvarez|Baldwin|Letham|Brunson|Jeff Gadman'
       - name: Official results
         env:
           # Scheduled runs have no inputs, so these defaults apply: general election, real write.
