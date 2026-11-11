@@ -1,0 +1,21 @@
+name: Data health check
+
+# Read-only checks on the data. The run fails (and GitHub emails you) when something is wrong:
+# a sync wiped records, results stopped updating, duplicate races, certified races without winners.
+on:
+  schedule:
+    - cron: "17 11 * * *"   # daily, after the nightly results sync
+  workflow_dispatch:
+
+jobs:
+  health:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup
+      - name: Health check
+        run: python agents/health-check.py
