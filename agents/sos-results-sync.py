@@ -79,6 +79,20 @@ def clean_party(raw: str) -> Optional[str]:
     return value.title() if value.isupper() else value
 
 
+PREFERS_SUFFIX = re.compile(r"\s*\(\s*(?:prefers|states)\s+(.*?)\s*\)\s*$", re.I)
+
+
+def split_candidate(name: str, party: str) -> tuple:
+    """'Chris Baldwin (Prefers Independent Party)' -> ('Chris Baldwin', 'Independent Party')."""
+    name = re.sub(r"\s+", " ", name or "").strip()
+    m = PREFERS_SUFFIX.search(name)
+    if m:
+        name = name[: m.start()].strip()
+        if not (party or "").strip():
+            party = "(" + m.group(0).strip().strip("()").strip() + ")"
+    return name, party
+
+
 def title_case(text: str) -> str:
     small = {"of", "and", "the", "for", "in"}
     words = re.split(r"(\s+)", text.lower())
@@ -290,7 +304,8 @@ def parse_contest(race: str, jurisdiction: str) -> Optional[dict]:
                     office_name="U.S. Senate Washington")
 
     stripped = re.sub(r"^washington state - ", "", low)
-    if stripped in STATEWIDE_OFFICES:
+    # A bare 'Treasurer' inside a county's results is that county's treasurer, not the state's.
+    if stripped in STATEWIDE_OFFICES and not (county_name_of(jurisdiction) and stripped == low):
         return dict(kind="statewide", district=None, position=None, level="state",
                     office_name=STATEWIDE_OFFICES[stripped])
     if re.match(r"president( ?/ ?vice president)?$", low):
@@ -348,8 +363,9 @@ def parse_rows(rows: list[dict]) -> list[dict]:
         if info is None:
             skipped[race] = skipped.get(race, 0) + 1
             continue
-        cand = html.unescape((row.get("Candidate") or "").strip())
-        if not cand or cand.upper() == "WRITE-IN":
+        cand, raw_party = split_candidate(html.unescape((row.get("Candidate") or "").strip()), row.get("Party") or "")
+        row = {**row, "Party": raw_party}
+        if not cand or cand.upper().replace(" ", "-") == "WRITE-IN":
             continue
         if cand.lower() in MEASURE_WORDS:
             continue
