@@ -672,6 +672,7 @@ def main() -> None:
     ap.add_argument("--dry-run", action="store_true", help="Show what would change, write nothing")
     ap.add_argument("--parse-only", action="store_true", help="Parse the files and print contests; no database access")
     ap.add_argument("--discover", action="store_true", help="List the results pages and export files the state site offers for --date, then exit")
+    ap.add_argument("--inspect", help="Debug: print raw contests whose JSON mentions this regex, then exit")
     ap.add_argument("--certified", action="store_true", help="Mark results as certified (default: unofficial)")
     ap.add_argument("--certify-recent", action="store_true",
                     help="Allow --certified for an election less than 30 days old (normally refused)")
@@ -686,6 +687,22 @@ def main() -> None:
         discover(args.date)
         return
 
+    if args.inspect:
+        import json
+        raw = requests.get(JSON_URL.format(date=args.date), timeout=180, headers={"User-Agent": "CommuneUSA data agent"}).text
+        data = json.loads(raw)
+        pat = re.compile(args.inspect)
+        def show(item, where):
+            if pat.search(json.dumps(item)):
+                slim = {k: v for k, v in item.items() if k != "ballotOptions"}
+                opts = [(o.get("name"), o.get("voteCount")) for o in item.get("ballotOptions") or []]
+                print(args.date, where, json.dumps(slim)[:300], opts[:8])
+        for it in (data.get("results") or {}).get("ballotItems") or []:
+            show(it, "STATE")
+        for jur in data.get("localResults") or []:
+            for it in jur.get("ballotItems") or []:
+                show(it, "LOCAL " + str(jur.get("name")))
+        return
     sources = list(args.file)
     if args.date and not re.fullmatch(r"\d{8}", args.date):
         ap.error("--date must look like 20261103")
