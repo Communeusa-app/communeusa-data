@@ -18,6 +18,7 @@ Run:
 """
 
 import logging
+import provenance
 import os
 import re
 import sys
@@ -387,6 +388,7 @@ def sync_county_officials(
     incoming: list[dict],
     covers=None,
     source: str = "source page",
+    source_key: str = "waco",
 ) -> None:
     """
     Reconcile scraped officials against the DB.
@@ -450,6 +452,7 @@ def sync_county_officials(
                 "phone":         api_row.get("phone"),
                 "email":         api_row.get("email"),
                 "is_active":     True,
+                **provenance.fields(source_key),
             }
             supabase.table("officials").insert(payload).execute()
             log.info("[%s] INSERT  county  %s  —  %s  (%s)",
@@ -472,6 +475,10 @@ def sync_county_officials(
             log.info("[%s] UPDATE  county  %s  —  %s  —  %s",
                      now, api_row["county_name"], official_name, changes)
             updated += 1
+
+    confirmed = provenance.stamp(
+        supabase, [existing[k]["id"] for k in incoming_keyed if k in existing], source_key)
+    log.info("Stamped %d county officials as verified against %s", confirmed, source_key)
 
     # ── FLAG INACTIVE ─────────────────────────────────────────────────────────
     for key, db_row in existing.items():
@@ -513,11 +520,11 @@ def main() -> None:
     html      = fetch_officials_page()
     officials = parse_officials(html)
 
-    sync_county_officials(supabase, wa_id, county_map, officials, source="the WACO directory")
+    sync_county_officials(supabase, wa_id, county_map, officials, source="the WACO directory", source_key="waco")
 
     board = load_board()
     sync_county_officials(supabase, wa_id, county_map, board, covers=board_covers,
-                          source="the WSAC directory")
+                          source="the WSAC directory", source_key="wsac")
 
     log.info("=== county-sync complete ===")
 
