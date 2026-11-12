@@ -24,6 +24,10 @@ from supabase import create_client
 
 # Smallest believable counts of active officials. A drop below these means a sync wiped data.
 FLOORS = {"federal": 12, "state": 147, "county": 150, "city": 300}
+STATEWIDE_OFFICES = [
+    "Governor", "Lieutenant Governor", "Attorney General", "Secretary of State", "State Treasurer",
+    "State Auditor", "Commissioner of Public Lands", "Superintendent of Public Instruction", "Insurance Commissioner",
+]
 EXPECTED_WA_COUNTIES = 39
 STALE_AFTER_DAYS = 3        # unofficial results should be refreshed nightly while counting
 VERIFIED_WITHIN_DAYS = {"federal": 10, "state": 10, "county": 10, "city": 40}   # weekly syncs; city is monthly
@@ -93,6 +97,13 @@ def check_officials(db, wa: str, rep: Report) -> None:
             (rep.error if level in ("federal", "state") else rep.warn)("officials", msg)
         else:
             rep.info("officials", msg)
+
+    have = {(o.get("office_title") or "").strip().lower() for o in active if o["level"] == "state"}
+    missing = [t for t in STATEWIDE_OFFICES if t.lower() not in have]
+    if missing:
+        rep.error("officials", f"{len(missing)} statewide offices have no active official: " + ", ".join(missing))
+    else:
+        rep.info("officials", "all nine statewide offices have an active official")
 
     blank = [o for o in active if not (o.get("official_name") or "").strip()]
     if blank:
