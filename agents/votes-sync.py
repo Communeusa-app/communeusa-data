@@ -62,6 +62,7 @@ CURRENT_CONGRESS   = 119           # 119th U.S. Congress (2025–2027)
 RECENT_VOTES_COUNT = int(os.environ.get("RECENT_VOTES_COUNT", "50"))   # Roll calls per House / Senate block
 OPENSTATES_PAGES   = int(os.environ.get("OPENSTATES_PAGES", "40"))     # Pages of WA state bills to scan
 OPENSTATES_LIMIT   = 50                                                # bills per page
+MAX_BILL_NAME      = 300           # characters kept of a bill name (the unique index has a size limit)
 OPENSTATES_PAUSE   = 6.5           # seconds between pages (Open States allows about 10 requests a minute)
 
 # Motion text patterns that indicate a final-passage roll call
@@ -309,8 +310,20 @@ def batch_insert(supabase: Client, rows: list[dict]) -> int:
     inserted = 0
     for i in range(0, len(rows), chunk):
         # ignore_duplicates uses ON CONFLICT DO NOTHING (requires the dedup unique constraint)
-        supabase.table("voting_records").upsert(rows[i : i + chunk], ignore_duplicates=True).execute()
-        inserted += len(rows[i : i + chunk])
+        batch = rows[i : i + chunk]
+        try:
+            supabase.table("voting_records").upsert(batch, ignore_duplicates=True).execute()
+            inserted += len(batch)
+        except Exception as exc:
+            # One bad row should not lose the other 99. Retry them one at a time and skip the culprit.
+            log.warning("Batch insert failed (%s); retrying row by row", str(exc)[:120])
+            for row in batch:
+                try:
+                    supabase.table("voting_records").upsert([row], ignore_duplicates=True).execute()
+                    inserted += 1
+                except Exception as row_exc:
+                    log.warning("Skipped one vote (%s | %s): %s", row.get("bill_name", "")[:60],
+                                row.get("vote_date"), str(row_exc)[:100])
     return inserted
 
 
@@ -628,6 +641,9 @@ def resolve_and_stage(
                 continue
 
         bill_name = clean(rec.get("bill_name"))
+        # The de-duplication index cannot hold very long values, so cap the name.
+        if bill_name and len(bill_name) > MAX_BILL_NAME:
+            bill_name = bill_name[:MAX_BILL_NAME].rstrip()
         vote_date = clean(rec.get("vote_date"))
         dup_key   = (official_id, bill_name, vote_date)
 
