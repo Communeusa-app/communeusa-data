@@ -174,12 +174,41 @@ def fetch_openstates_legislators(api_key: str) -> list[dict]:
 
 # ── Congress.gov ──────────────────────────────────────────────────────────────
 
+def _ordinal(n: int) -> str:
+    suffix = "th" if 10 <= n % 100 <= 20 else {1: "st", 2: "nd", 3: "rd"}.get(n % 10, "th")
+    return f"{n}{suffix}"
+
+
+def congress_office_label(term: dict) -> str | None:
+    """'U.S. Senator, Washington' or 'U.S. Representative, Washington, 1st District' from one Congress.gov term."""
+    chamber = term.get("chamber", "")
+    place = clean(term.get("stateName")) or clean(term.get("stateCode"))
+    if chamber == "Senate":
+        title = "U.S. Senator"
+    elif chamber == "House of Representatives":
+        title = "U.S. Representative"
+    else:
+        return None
+    parts = [title]
+    if place:
+        parts.append(place)
+    if chamber == "House of Representatives" and place:
+        try:
+            district = int(term.get("district"))
+        except (TypeError, ValueError):
+            district = None
+        if district == 0:
+            parts.append("At-Large")
+        elif district:
+            parts.append(f"{_ordinal(district)} District")
+    return ", ".join(parts)
+
+
 def merge_congress_terms(terms: list[dict]) -> list[dict]:
-    """Congress.gov lists one entry per Congress; join consecutive ones in the same chamber into one stretch."""
-    office = {"House of Representatives": "U.S. Representative", "Senate": "U.S. Senator"}
+    """Congress.gov lists one entry per Congress; join consecutive ones for the same office, state and district."""
     spans: list[dict] = []
     for t in sorted((t for t in terms if t.get("startYear")), key=lambda x: x["startYear"]):
-        name = office.get(t.get("chamber", ""))
+        name = congress_office_label(t)
         if not name:
             continue
         start, end = int(t["startYear"]), (int(t["endYear"]) if t.get("endYear") else None)
@@ -473,9 +502,14 @@ def sync_federal_history(supabase: Client, members: list[dict]) -> None:
     out = []
     for m in members:
         oid = ids.get(m["official_name"])
-        if not oid:
+        history = m.get("history") or []
+        if not oid or not history:
             continue
-        for span in m.get("history") or []:
+        if "Washington" not in history[-1]["office"]:
+            log.warning("%s: current office in history is %r, expected Washington", m["official_name"], history[-1]["office"])
+        # Replace this member's earlier Congress.gov entries (older runs stored offices without a state).
+        supabase.table("official_terms").delete().eq("official_id", oid).eq("source", "Congress.gov").execute()
+        for span in history:
             out.append({
                 "official_id": oid, "office": span["office"],
                 "start_year": span["start_year"], "end_year": span["end_year"],
