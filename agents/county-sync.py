@@ -173,13 +173,22 @@ def fetch_board_page() -> Optional[str]:
     return None
 
 
+def board_district(raw: Optional[str]) -> Optional[str]:
+    """'District 3' (also the directory's 'Disrtict 3') -> '3'; 'At-Large (A)' -> 'At-Large'; anything else -> None."""
+    text = (raw or "").strip()
+    if re.search(r"at[- ]?large", text, re.I):
+        return "At-Large"
+    m = re.search(r"\b(\d{1,2})\b", text)
+    return m.group(1) if m else None
+
+
 def board_rows_to_officials(table_rows: list[list[str]]) -> list[dict]:
     """Rows of [county, district, title, first name, last name] -> officials."""
     results: list[dict] = []
     for cells in table_rows:
         if len(cells) < 5 or not cells[0] or not cells[0].endswith(" County"):
             continue
-        county, _district, raw_title, first, last = [clean(c) for c in cells[:5]]
+        county, raw_district, raw_title, first, last = [clean(c) for c in cells[:5]]
         if not first or not last or first.lower() == "vacant":
             continue
         m = re.match(r"^\S+\s*\((.+)\)$", first)      # 'Charles (Chuck)' -> 'Chuck'
@@ -197,6 +206,7 @@ def board_rows_to_officials(table_rows: list[list[str]]) -> list[dict]:
             "county_name": strip_county_suffix(county),
             "official_name": re.sub(r"\s+", " ", f"{first} {last}").strip(),
             "office_title": title, "phone": None, "email": None,
+            "district": board_district(raw_district),
         })
     log.info("Parsed %d county board members across %d counties (WSAC)",
              len(results), len({r["county_name"] for r in results}))
@@ -369,7 +379,7 @@ def get_existing_county_officials(supabase: Client) -> dict[tuple, dict]:
     """
     res = (
         supabase.table("officials")
-        .select("id,official_name,office_title,county_id,phone,email,is_active")
+        .select("id,official_name,office_title,county_id,phone,email,district,is_active")
         .eq("level", "county")
         .execute()
     )
@@ -451,6 +461,7 @@ def sync_county_officials(
                 "office_title":  office_title,
                 "phone":         api_row.get("phone"),
                 "email":         api_row.get("email"),
+                "district":      api_row.get("district"),
                 "is_active":     True,
                 **provenance.fields(source_key),
             }
@@ -461,7 +472,7 @@ def sync_county_officials(
             continue
 
         changes: dict = {}
-        for field in ("phone", "email", "official_name", "office_title"):
+        for field in ("phone", "email", "official_name", "office_title", "district"):
             new_val = clean(api_row.get(field))
             old_val = clean(db_row.get(field))
             if new_val != old_val and new_val is not None:
