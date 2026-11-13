@@ -23,6 +23,7 @@ Run:
     python3 agents/votes-sync.py
 """
 
+import argparse
 import logging
 import os
 import re
@@ -58,9 +59,10 @@ SENATE_VOTE_BASE = "https://www.senate.gov/legislative/LIS/roll_call_votes"
 CURRENT_SESSION    = "2025-2026"   # WA state legislative session
 CURRENT_CONGRESS   = 119           # 119th U.S. Congress (2025–2027)
 
-RECENT_VOTES_COUNT = 50            # Roll calls to fetch per House / Senate block
-OPENSTATES_PAGES   = 5             # Pages of WA state bills to scan (50 bills/page)
-OPENSTATES_LIMIT   = 50
+RECENT_VOTES_COUNT = int(os.environ.get("RECENT_VOTES_COUNT", "50"))   # Roll calls per House / Senate block
+OPENSTATES_PAGES   = int(os.environ.get("OPENSTATES_PAGES", "40"))     # Pages of WA state bills to scan
+OPENSTATES_LIMIT   = 50                                                # bills per page
+OPENSTATES_PAUSE   = 6.5           # seconds between pages (Open States allows about 10 requests a minute)
 
 # Motion text patterns that indicate a final-passage roll call
 FINAL_PASSAGE_RE = re.compile(
@@ -240,8 +242,15 @@ def build_house_last_lookup(supabase: Client) -> dict[str, Optional[str]]:
         if "representative" not in title and "house" not in title:
             continue
         name = row["official_name"] or ""
-        last = name.rsplit(" ", 1)[-1].lower()
-        candidates.setdefault(last, []).append((row["id"], name))
+        parts = name.replace(".", "").split()
+        if not parts:
+            continue
+        # The Clerk lists compound surnames whole ("Gluesenkamp Perez"), so index the last word and the last two.
+        keys = {parts[-1].lower()}
+        if len(parts) >= 3:
+            keys.add(" ".join(parts[-2:]).lower())
+        for last in keys:
+            candidates.setdefault(last, []).append((row["id"], name))
 
     lookup: dict[str, Optional[str]] = {}
     for last, entries in candidates.items():
@@ -305,18 +314,24 @@ def fetch_wa_state_votes(api_key: str) -> list[dict]:
 
     for page in range(1, OPENSTATES_PAGES + 1):
         try:
-            resp = requests.get(
-                f"{OPENSTATES_BASE}/bills",
-                params={
-                    "jurisdiction": "wa",
-                    "session":      CURRENT_SESSION,
-                    "include":      "votes",
-                    "limit":        OPENSTATES_LIMIT,
-                    "page":         page,
-                },
-                headers=headers,
-                timeout=30,
-            )
+            for attempt in range(4):
+                resp = requests.get(
+                    f"{OPENSTATES_BASE}/bills",
+                    params={
+                        "jurisdiction": "wa",
+                        "session":      CURRENT_SESSION,
+                        "include":      "votes",
+                        "limit":        OPENSTATES_LIMIT,
+                        "page":         page,
+                    },
+                    headers=headers,
+                    timeout=60,
+                )
+                if resp.status_code != 429:
+                    break
+                wait = 30 * (attempt + 1)
+                log.info("Open States asked us to slow down (HTTP 429), waiting %ds", wait)
+                time.sleep(wait)
             resp.raise_for_status()
         except Exception as exc:
             log.warning("Open States page %d error: %s", page, exc)
@@ -368,7 +383,7 @@ def fetch_wa_state_votes(api_key: str) -> list[dict]:
         pagination = data.get("pagination") or {}
         if page >= (pagination.get("max_page") or page):
             break
-        time.sleep(0.25)
+        time.sleep(OPENSTATES_PAUSE)
 
     log.info("Open States — %d raw WA state vote records across %d pages", len(records), page)
     return records
@@ -562,6 +577,9 @@ def fetch_senate_votes(congress: int, session: int, congress_key: str) -> list[d
 
 # ── Resolution ────────────────────────────────────────────────────────────────
 
+UNMATCHED: dict[str, int] = {}
+
+
 def resolve_and_stage(
     records: list[dict],
     source: str,
@@ -585,6 +603,7 @@ def resolve_and_stage(
             official_id = house_last_lookup.get(last)
             if official_id is None:
                 log.warning("[%s] House: no match for last name %r", source, last)
+                UNMATCHED[f"House: {last}"] = UNMATCHED.get(f"House: {last}", 0) + 1
                 unmatched += 1
                 continue
         else:
@@ -592,6 +611,7 @@ def resolve_and_stage(
             official_id = name_lookup.get(name_key)
             if official_id is None:
                 log.warning("[%s] No match for %r", source, name_key)
+                UNMATCHED[f"{source}: {name_key}"] = UNMATCHED.get(f"{source}: {name_key}", 0) + 1
                 unmatched += 1
                 continue
 
@@ -629,6 +649,9 @@ def resolve_and_stage(
 # ── Entry point ────────────────────────────────────────────────────────────────
 
 def main() -> None:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--dry-run", action="store_true", help="show counts and unmatched names, write nothing")
+    args = ap.parse_args()
     url       = os.environ.get("SUPABASE_URL")
     key       = os.environ.get("SUPABASE_SERVICE_KEY")
     os_key    = os.environ.get("OPENSTATES_API_KEY")
@@ -677,6 +700,14 @@ def main() -> None:
     for session in (1, 2):
         run(fetch_senate_votes(CURRENT_CONGRESS, session, cg_key), f"senate-s{session}")
 
+    if UNMATCHED:
+        log.info("Unmatched names (no official row found), most frequent first:")
+        for name, n in sorted(UNMATCHED.items(), key=lambda kv: -kv[1])[:60]:
+            log.info("    %4d  %s", n, name)
+    if args.dry_run:
+        log.info("=== dry run: %d new votes would be added, %d duplicate, %d unmatched ===",
+                 len(all_rows), total_duplicates, total_unmatched)
+        return
     inserted = batch_insert(supabase, all_rows)
     log.info(
         "=== votes-sync complete: %d inserted, %d duplicate, %d unmatched ===",
