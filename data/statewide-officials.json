@@ -8,7 +8,15 @@
     "official_website": "https://governor.wa.gov",
     "term_start": "2025",
     "term_end": "2029",
-    "verify_url": "https://governor.wa.gov"
+    "verify_url": "https://governor.wa.gov",
+    "history": [
+      {
+        "office": "Governor",
+        "start_year": 2025,
+        "end_year": null,
+        "how_assumed": "elected"
+      }
+    ]
   },
   {
     "office_title": "Lieutenant Governor",
@@ -19,7 +27,15 @@
     "official_website": "https://ltgov.wa.gov",
     "term_start": "2025",
     "term_end": "2029",
-    "verify_url": "https://www.ltgov.wa.gov/contact-1"
+    "verify_url": "https://www.ltgov.wa.gov/contact-1",
+    "history": [
+      {
+        "office": "Lieutenant Governor",
+        "start_year": 2025,
+        "end_year": null,
+        "how_assumed": "elected"
+      }
+    ]
   },
   {
     "office_title": "Attorney General",
@@ -30,7 +46,15 @@
     "official_website": "https://www.atg.wa.gov",
     "term_start": "2025",
     "term_end": "2029",
-    "verify_url": "https://atg.wa.gov/office-attorney-general-nick-brown"
+    "verify_url": "https://atg.wa.gov/office-attorney-general-nick-brown",
+    "history": [
+      {
+        "office": "Attorney General",
+        "start_year": 2025,
+        "end_year": null,
+        "how_assumed": "elected"
+      }
+    ]
   },
   {
     "office_title": "Secretary of State",
@@ -45,6 +69,15 @@
       "https://sos.wa.gov/node/11561",
       "https://sos.wa.gov/office",
       "https://apps.sos.wa.gov/office/secretary-of-state-steve-hobbs.aspx"
+    ],
+    "history": [
+      {
+        "office": "Secretary of State",
+        "start_year": 2021,
+        "end_year": null,
+        "how_assumed": "appointed",
+        "note": "Appointed by Gov. Jay Inslee in November 2021 to replace Kim Wyman, who resigned"
+      }
     ]
   },
   {
@@ -56,7 +89,15 @@
     "official_website": "https://tre.wa.gov",
     "term_start": "2021",
     "term_end": "2029",
-    "verify_url": "https://tre.wa.gov/about-us"
+    "verify_url": "https://tre.wa.gov/about-us",
+    "history": [
+      {
+        "office": "State Treasurer",
+        "start_year": 2021,
+        "end_year": null,
+        "how_assumed": "elected"
+      }
+    ]
   },
   {
     "office_title": "State Auditor",
@@ -67,7 +108,15 @@
     "official_website": "https://sao.wa.gov",
     "term_start": "2017",
     "term_end": "2029",
-    "verify_url": "https://sao.wa.gov/about-sao/state-auditor-pat-mccarthy"
+    "verify_url": "https://sao.wa.gov/about-sao/state-auditor-pat-mccarthy",
+    "history": [
+      {
+        "office": "State Auditor",
+        "start_year": 2017,
+        "end_year": null,
+        "how_assumed": "elected"
+      }
+    ]
   },
   {
     "office_title": "Commissioner of Public Lands",
@@ -78,7 +127,15 @@
     "official_website": "https://dnr.wa.gov/cpl",
     "term_start": "2025",
     "term_end": "2029",
-    "verify_url": "https://dnr.wa.gov/cpl"
+    "verify_url": "https://dnr.wa.gov/cpl",
+    "history": [
+      {
+        "office": "Commissioner of Public Lands",
+        "start_year": 2025,
+        "end_year": null,
+        "how_assumed": "elected"
+      }
+    ]
   },
   {
     "office_title": "Superintendent of Public Instruction",
@@ -89,7 +146,15 @@
     "official_website": "https://ospi.k12.wa.us",
     "term_start": "2017",
     "term_end": "2029",
-    "verify_url": "https://ospi.k12.wa.us"
+    "verify_url": "https://ospi.k12.wa.us",
+    "history": [
+      {
+        "office": "Superintendent of Public Instruction",
+        "start_year": 2017,
+        "end_year": null,
+        "how_assumed": "elected"
+      }
+    ]
   },
   {
     "office_title": "Insurance Commissioner",
@@ -100,6 +165,14 @@
     "official_website": "https://www.insurance.wa.gov",
     "term_start": "2025",
     "term_end": "2029",
-    "verify_url": "https://insurance.wa.gov/about-us"
+    "verify_url": "https://insurance.wa.gov/about-us",
+    "history": [
+      {
+        "office": "Insurance Commissioner",
+        "start_year": 2025,
+        "end_year": null,
+        "how_assumed": "elected"
+      }
+    ]
   }
 ]

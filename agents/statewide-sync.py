@@ -86,6 +86,12 @@ def main() -> None:
             continue
         if changes:
             db.table("officials").update(changes).eq("id", row["id"]).execute()
+        for h in e.get("history") or []:
+            db.table("official_terms").upsert({
+                "official_id": row["id"], "office": h["office"], "start_year": h["start_year"],
+                "end_year": h.get("end_year"), "how_assumed": h.get("how_assumed"), "note": h.get("note"),
+                "source": "Official office website", "source_url": confirmed_at,
+            }, on_conflict="official_id,office,start_year").execute()
         db.table("officials").update(
             {**provenance.fields_for("Official office website", confirmed_at)}
         ).eq("id", row["id"]).execute()
