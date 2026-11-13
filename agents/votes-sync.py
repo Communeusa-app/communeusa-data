@@ -192,10 +192,22 @@ def build_name_lookup(supabase: Client) -> dict[str, Optional[str]]:
     duplicates), keep the first ID seen. Only mark None when rows differ in
     level/title and cannot be disambiguated.
     """
-    res = supabase.table("officials").select("id,official_name,level,office_title").eq("is_active", True).execute()
+    # Supabase returns at most 1000 rows per request, and there are thousands of officials,
+    # so read every page. Without this, most state House members were never found.
+    rows: list[dict] = []
+    offset, page_size = 0, 1000
+    while True:
+        batch = (
+            supabase.table("officials").select("id,official_name,level,office_title")
+            .eq("is_active", True).order("id").range(offset, offset + page_size - 1).execute().data or []
+        )
+        rows.extend(batch)
+        if len(batch) < page_size:
+            break
+        offset += page_size
     # name → list of (id, level, office_title)
     candidates: dict[str, list[tuple[str, str, str]]] = {}
-    for row in res.data or []:
+    for row in rows:
         key = (row["official_name"] or "").strip().lower()
         if not key:
             continue
