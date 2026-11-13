@@ -1,0 +1,11 @@
+{
+  "_about": "Officials who have left office but are still listed by a source that lags. data-sync skips anyone named here, so they are marked inactive and not re-added. Delete an entry once the source stops listing the person, or if they return to office.",
+  "departures": [
+    {
+      "name": "Skyler Rude",
+      "level": "state",
+      "note": "No longer serving in the Washington House; Open States still listed him (reported by project owner, Nov 2026)",
+      "added": "2026-11-12"
+    }
+  ]
+}
