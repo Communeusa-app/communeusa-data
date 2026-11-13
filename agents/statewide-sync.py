@@ -71,8 +71,10 @@ def main() -> None:
             log.error("%s: no row for %s in the database (the officeholder may have changed)", title, name)
             problems += 1
             continue
-        if not page_names_official(e["verify_url"], name):
-            log.warning("%s: %s not confirmed on %s, leaving the record unverified", title, name, e["verify_url"])
+        candidates = e["verify_url"] if isinstance(e["verify_url"], list) else [e["verify_url"]]
+        confirmed_at = next((u for u in candidates if page_names_official(u, name)), None)
+        if not confirmed_at:
+            log.warning("%s: %s not confirmed on %s, leaving the record unverified", title, name, ", ".join(candidates))
             problems += 1
             continue
         row = rows[0]
@@ -85,7 +87,7 @@ def main() -> None:
         if changes:
             db.table("officials").update(changes).eq("id", row["id"]).execute()
         db.table("officials").update(
-            {**provenance.fields_for("Official office website", e["verify_url"])}
+            {**provenance.fields_for("Official office website", confirmed_at)}
         ).eq("id", row["id"]).execute()
         verified += 1
     log.info("%d verified, %d need attention", verified, problems)
