@@ -173,6 +173,25 @@ def fetch_openstates_legislators(api_key: str) -> list[dict]:
 
 # ── Congress.gov ──────────────────────────────────────────────────────────────
 
+def merge_congress_terms(terms: list[dict]) -> list[dict]:
+    """Congress.gov lists one entry per Congress; join consecutive ones in the same chamber into one stretch."""
+    office = {"House of Representatives": "U.S. Representative", "Senate": "U.S. Senator"}
+    spans: list[dict] = []
+    for t in sorted((t for t in terms if t.get("startYear")), key=lambda x: x["startYear"]):
+        name = office.get(t.get("chamber", ""))
+        if not name:
+            continue
+        start, end = int(t["startYear"]), (int(t["endYear"]) if t.get("endYear") else None)
+        last = spans[-1] if spans else None
+        if last and last["office"] == name and last["end_year"] is not None and start <= last["end_year"]:
+            last["end_year"] = end
+        else:
+            spans.append({"office": name, "start_year": start, "end_year": end})
+    if spans:
+        spans[-1]["end_year"] = None   # a current member is still serving
+    return spans
+
+
 def fetch_congress_members(api_key: str) -> list[dict]:
     """
     Return current WA members of Congress from Congress.gov.
@@ -225,6 +244,7 @@ def fetch_congress_members(api_key: str) -> list[dict]:
             "term_start":      clean(str(current_term["startYear"])) if current_term.get("startYear") else None,
             "term_end":        term_end,
             "official_website": clean(detail.get("officialUrl")),
+            "history":         merge_congress_terms(terms),
         })
 
         time.sleep(0.5)  # Congress.gov rate limit headroom
@@ -427,6 +447,27 @@ def sync_officials(
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
+def sync_federal_history(supabase: Client, members: list[dict]) -> None:
+    """Write each federal member's years of service (Congress.gov) to official_terms."""
+    rows = (supabase.table("officials").select("id,official_name").eq("level", "federal").eq("is_active", True)
+            .execute().data or [])
+    ids = {r["official_name"]: r["id"] for r in rows}
+    out = []
+    for m in members:
+        oid = ids.get(m["official_name"])
+        if not oid:
+            continue
+        for span in m.get("history") or []:
+            out.append({
+                "official_id": oid, "office": span["office"],
+                "start_year": span["start_year"], "end_year": span["end_year"],
+                "source": "Congress.gov", "source_url": "https://www.congress.gov/members",
+            })
+    for start in range(0, len(out), 100):
+        supabase.table("official_terms").upsert(out[start:start + 100], on_conflict="official_id,office,start_year").execute()
+    log.info("Office history: wrote %d stretches of service for %d federal members", len(out), len(ids))
+
+
 def main() -> None:
     supabase_url  = os.environ.get("SUPABASE_URL")
     supabase_key  = os.environ.get("SUPABASE_SERVICE_KEY")
@@ -457,6 +498,7 @@ def main() -> None:
     # ── Federal legislators (Congress.gov) ───────────────────────────────────
     federal_members = fetch_congress_members(congress_key)
     sync_officials(supabase, wa_id, federal_members, "federal")
+    sync_federal_history(supabase, federal_members)
 
     log.info("=== data-sync complete ===")
 
