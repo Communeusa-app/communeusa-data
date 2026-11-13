@@ -1,0 +1,37 @@
+name: Sync bios
+
+# Short Wikipedia-sourced background paragraphs for federal and state officials (CC BY-SA, credited on the site).
+on:
+  schedule:
+    - cron: "41 11 1 * *"   # monthly, 1st at 11:41 UTC
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Show matches without saving"
+        type: boolean
+        default: true
+      refresh:
+        description: "Re-fetch bios older than 90 days"
+        type: boolean
+        default: false
+
+concurrency:
+  group: sync-bios
+  cancel-in-progress: false
+
+jobs:
+  bios:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup
+      - name: Fetch bios
+        run: |
+          ARGS=""
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.dry_run }}" = "true" ]; then ARGS="$ARGS --dry-run"; fi
+          if [ "${{ inputs.refresh }}" = "true" ]; then ARGS="$ARGS --refresh"; fi
+          python agents/bio-sync.py $ARGS
