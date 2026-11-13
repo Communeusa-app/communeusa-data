@@ -16,6 +16,7 @@ Run:
     python agents/data-sync.py
 """
 
+import json
 import logging
 import provenance
 import os
@@ -368,6 +369,19 @@ def get_existing_officials(supabase: Client, level: str) -> dict[str, dict]:
 
 # ── Core sync logic ───────────────────────────────────────────────────────────
 
+DEPARTURES_FILE = Path(__file__).resolve().parent.parent / "data" / "known-departures.json"
+
+
+def known_departures(level: str) -> set[str]:
+    """Names of people who have left office but may still be listed by a lagging source."""
+    try:
+        entries = json.loads(DEPARTURES_FILE.read_text()).get("departures", [])
+    except (OSError, ValueError) as exc:
+        log.warning("Could not read %s: %s", DEPARTURES_FILE.name, exc)
+        return set()
+    return {e["name"] for e in entries if e.get("level") == level and e.get("name")}
+
+
 def sync_officials(
     supabase: Client,
     wa_id: str,
@@ -383,6 +397,10 @@ def sync_officials(
     """
     existing = get_existing_officials(supabase, level)
     incoming_by_name = {r["official_name"]: r for r in incoming if r.get("official_name")}
+    for gone in sorted(known_departures(level) & set(incoming_by_name)):
+        log.info("Skipping %s: listed in data/known-departures.json (source still lists them; "
+                 "remove the entry once it stops)", gone)
+        del incoming_by_name[gone]
     source_key = "openstates" if level == "state" else "congress"
 
     inserted = updated = flagged = 0
