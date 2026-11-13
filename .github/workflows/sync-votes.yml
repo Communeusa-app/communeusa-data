@@ -1,0 +1,44 @@
+name: Sync votes
+
+# Roll-call votes: Washington legislators (Open States) and U.S. House and Senate members (Clerk and Senate.gov feeds).
+on:
+  schedule:
+    - cron: "43 8 * * 2"    # Tuesdays 08:43 UTC
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Show counts and unmatched names without saving"
+        type: boolean
+        default: true
+      openstates_pages:
+        description: "Pages of state bills to scan (50 bills per page)"
+        default: "40"
+        required: false
+      recent_votes:
+        description: "Federal roll calls to fetch per chamber and year"
+        default: "50"
+        required: false
+
+concurrency:
+  group: sync-votes
+  cancel-in-progress: false
+
+jobs:
+  votes:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+      OPENSTATES_API_KEY: ${{ secrets.OPENSTATES_API_KEY }}
+      CONGRESS_API_KEY: ${{ secrets.CONGRESS_API_KEY }}
+      OPENSTATES_PAGES: ${{ inputs.openstates_pages || '40' }}
+      RECENT_VOTES_COUNT: ${{ inputs.recent_votes || '50' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup
+      - name: Fetch votes
+        run: |
+          ARGS=""
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.dry_run }}" = "true" ]; then ARGS="--dry-run"; fi
+          python agents/votes-sync.py $ARGS
