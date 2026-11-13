@@ -50,6 +50,22 @@ PARTY_MAP = {
 SUFFIXES = {"jr", "sr", "ii", "iii", "iv"}
 
 
+OFFICE_CLASSES = [
+    ("assessor", r"assessor"), ("auditor", r"auditor"), ("clerk", r"\bclerk\b"),
+    ("coroner", r"coroner|medical examiner"), ("prosecutor", r"prosecut"), ("sheriff", r"sheriff"),
+    ("treasurer", r"treasur"), ("executive", r"\bexecutive\b"), ("board", r"commissioner|council"),
+]
+
+
+def office_class(text: str | None) -> str | None:
+    """Kind of county office ('sheriff', 'board', ...) from a title or race name, or None if unrecognised."""
+    low = (text or "").lower()
+    for name, pattern in OFFICE_CLASSES:
+        if re.search(pattern, low):
+            return name
+    return None
+
+
 def fetch_all(query, page: int = 1000) -> list[dict]:
     """Supabase returns at most 1000 rows per request, so read every page."""
     rows, offset = [], 0
@@ -85,7 +101,7 @@ def main() -> int:
     this_year = datetime.now(timezone.utc).year
 
     officials = fetch_all(lambda: sb.table("officials")
-        .select("id,official_name,office_title,party,term_start,term_end,county_id,counties(name)")
+        .select("id,official_name,office_title,party,term_start,term_end,district,county_id,counties(name)")
         .eq("level", "county").eq("is_active", True).order("id"))
     elections = fetch_all(lambda: sb.table("elections")
         .select("id,office_name,election_date,election_type,county_id")
@@ -107,19 +123,23 @@ def main() -> int:
         wins_by_county[e["county_id"]].append({
             "key": name_key(w["name"]), "official_id": w.get("official_id"), "party": (w.get("party") or "").strip(),
             "year": year, "office_name": e["office_name"], "name": w["name"],
+            "class": office_class(e["office_name"]),
         })
 
-    updates, term_rows, no_win, mismatches = [], [], [], []
+    updates, term_rows, no_win, corrections, needs_review = [], [], [], [], []
     filled_party = fixed_terms = 0
     for o in officials:
         key = name_key(o["official_name"])
         county = (o.get("counties") or {}).get("name") or "?"
-        mine = [w for w in wins_by_county.get(o["county_id"], [])
-                if w["official_id"] == o["id"] or (key and w["key"] == key)]
+        my_class = office_class(o.get("office_title"))
+        # A win only counts when it is the same kind of office in the same county. Without this, a
+        # commissioner and a same-named sheriff in one county could be mixed up.
+        pool = [w for w in wins_by_county.get(o["county_id"], []) if my_class and w["class"] == my_class]
+        mine = [w for w in pool if w["official_id"] == o["id"] or (key and w["key"] == key)]
+        exact = bool(mine)
         if not mine:
-            # nicknames (Bob / Robert): same last name and first initial, only when it is unambiguous
-            cand = [w for w in wins_by_county.get(o["county_id"], [])
-                    if key and w["key"] and w["key"][1] == key[1] and w["key"][0][:1] == key[0][:1]]
+            # nicknames (Bob / Robert): same last name and first initial, only when unambiguous
+            cand = [w for w in pool if key and w["key"] and w["key"][1] == key[1] and w["key"][0][:1] == key[0][:1]]
             if len({w["name"] for w in cand}) == 1:
                 mine = cand
         if not mine:
@@ -130,11 +150,21 @@ def main() -> int:
         change: dict = {}
 
         ballot_party = PARTY_MAP.get(latest["party"].lower())
-        if ballot_party and not (o.get("party") or "").strip():
+        stored_party = (o.get("party") or "").strip()
+        if ballot_party and not stored_party and exact:
             change["party"] = ballot_party
             filled_party += 1
-        elif ballot_party and o.get("party") and o["party"].strip() != ballot_party:
-            mismatches.append(f'{county}: {o["official_name"]} stored {o["party"]!r}, ballot says {ballot_party!r}')
+        elif ballot_party and stored_party and stored_party != ballot_party:
+            # The certified ballot is the primary source, so it wins over an unverified old value, but
+            # only for an exact name match. A looser match is reported for a person to check and is
+            # never written. Every correction is listed so it can be verified against the source.
+            line = (f'{county}: {o["official_name"]} ({o["office_title"]}) stored {stored_party!r}, '
+                    f'{latest["year"]} ballot says {ballot_party!r} (race: {latest["office_name"]})')
+            if exact:
+                change["party"] = ballot_party
+                corrections.append(line)
+            else:
+                needs_review.append(line)
 
         end_year = latest["year"] + TERM_YEARS
         stored_end = year_of(o.get("term_end"))
@@ -146,6 +176,9 @@ def main() -> int:
             updates.append((o["id"], o["official_name"], county, change))
 
         title = f'{o["office_title"]}, {county} County' if o.get("office_title") else f"{county} County"
+        district = (o.get("district") or "").strip()
+        if district:
+            title += f", District {district}" if district.isdigit() else f", {district}"
         for w in mine:
             start, end = w["year"] + 1, w["year"] + TERM_YEARS
             term_rows.append({
@@ -161,8 +194,10 @@ def main() -> int:
         log.info("... and %d more", len(updates) - 80)
     log.info("%d officials matched to a win; party filled for %d; term dates set or corrected for %d; %d history rows",
              len(officials) - len(no_win), filled_party, fixed_terms, len(term_rows))
-    for m in mismatches:
-        log.warning("Party differs: %s", m)
+    for c in corrections:
+        log.warning("PARTY CORRECTED: %s", c)
+    for r in needs_review:
+        log.warning("PARTY NEEDS REVIEW (not changed): %s", r)
     log.info("%d officials with no winning race in our data (left unchanged), for example:", len(no_win))
     for n in no_win[:25]:
         log.info("    %s", n)
@@ -172,6 +207,10 @@ def main() -> int:
         return 0
     for oid, _n, _c, change in updates:
         sb.table("officials").update(change).eq("id", oid).execute()
+    # Replace this agent's earlier rows so a changed label (for example once a district is known) never leaves duplicates.
+    owners = sorted({r["official_id"] for r in term_rows})
+    for i in range(0, len(owners), 100):
+        sb.table("official_terms").delete().in_("official_id", owners[i:i + 100]).eq("source", SOURCE).execute()
     for i in range(0, len(term_rows), 100):
         sb.table("official_terms").upsert(term_rows[i:i + 100], on_conflict="official_id,office,start_year").execute()
     log.info("=== applied ===")
