@@ -186,7 +186,7 @@ def enrich_bill_title(bill_ref: str, api_key: str) -> Optional[str]:
 
 # ── Supabase helpers ───────────────────────────────────────────────────────────
 
-def build_name_lookup(supabase: Client) -> dict[str, Optional[str]]:
+def build_name_lookup(supabase: Client, level: Optional[str] = None) -> dict[str, Optional[str]]:
     """
     Build a full-name → official_id lookup for all active officials.
     When the same name maps to multiple rows with identical title+level (true
@@ -206,6 +206,10 @@ def build_name_lookup(supabase: Client) -> dict[str, Optional[str]]:
         if len(batch) < page_size:
             break
         offset += page_size
+    # A state vote can only belong to a state official, a Senate vote to a federal one. Narrowing by
+    # level keeps a county or city official with the same name from making the match ambiguous.
+    if level:
+        rows = [r for r in rows if r.get("level") == level]
     # name → list of (id, level, office_title)
     candidates: dict[str, list[tuple[str, str, str]]] = {}
     for row in rows:
@@ -416,20 +420,31 @@ def fetch_wa_state_votes(api_key: str) -> list[dict]:
 
 # ── House Clerk roll call XML ──────────────────────────────────────────────────
 
+HOUSE_HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; CommuneUSA-bot/1.0; +https://www.communeusa.com)"}
+
+
+def house_roll_exists(url: str) -> bool:
+    """HEAD requests to clerk.house.gov are not reliable, so ask with a streamed GET and read nothing."""
+    try:
+        with requests.get(url, headers=HOUSE_HEADERS, timeout=20, stream=True) as r:
+            return r.status_code == 200
+    except Exception:
+        return False
+
+
 def find_max_house_roll(year: int) -> int:
     """Binary search for the highest existing roll call number for a given year."""
-    lo, hi = 1, 500
+    lo, hi = 1, 1000
     while lo < hi:
         mid = (lo + hi + 1) // 2
         url = f"{HOUSE_CLERK_BASE}/{year}/roll{mid:03d}.xml"
-        try:
-            r = requests.head(url, timeout=10)
-            if r.status_code == 200:
-                lo = mid
-            else:
-                hi = mid - 1
-        except Exception:
+        if house_roll_exists(url):
+            lo = mid
+        else:
             hi = mid - 1
+    if lo == 1 and not house_roll_exists(f"{HOUSE_CLERK_BASE}/{year}/roll001.xml"):
+        log.warning("House %d: could not reach the Clerk's roll call feed", year)
+        return 0
     return lo
 
 
@@ -450,7 +465,7 @@ def fetch_house_votes(year: int, congress_key: str) -> list[dict]:
     for roll_num in range(max_roll, start - 1, -1):
         url = f"{HOUSE_CLERK_BASE}/{year}/roll{roll_num:03d}.xml"
         try:
-            resp = requests.get(url, timeout=20)
+            resp = requests.get(url, headers=HOUSE_HEADERS, timeout=20)
             if resp.status_code != 200:
                 continue
             root = ET.fromstring(resp.content)
@@ -697,36 +712,37 @@ def main() -> None:
     log.info("=== CommuneUSA votes-sync starting ===")
     supabase: Client = create_client(url, key)
 
-    name_lookup       = build_name_lookup(supabase)
+    state_lookup      = build_name_lookup(supabase, "state")
+    federal_lookup    = build_name_lookup(supabase, "federal")
     house_last_lookup = build_house_last_lookup(supabase)
     existing_keys     = load_existing_keys(supabase)
-    log.info("Loaded %d officials and %d existing vote records",
-             len(name_lookup), len(existing_keys))
+    log.info("Loaded %d state and federal officials and %d existing vote records",
+             len(state_lookup) + len(federal_lookup), len(existing_keys))
 
     all_rows:    list[dict] = []
     total_unmatched  = 0
     total_duplicates = 0
 
-    def run(records: list[dict], source: str) -> None:
+    def run(records: list[dict], source: str, lookup: dict) -> None:
         nonlocal total_unmatched, total_duplicates
         rows, um, dups = resolve_and_stage(
-            records, source, name_lookup, house_last_lookup, existing_keys
+            records, source, lookup, house_last_lookup, existing_keys
         )
         all_rows.extend(rows)
         total_unmatched  += um
         total_duplicates += dups
 
     # WA State Legislature (Open States)
-    run(fetch_wa_state_votes(os_key), "state")
+    run(fetch_wa_state_votes(os_key), "state", state_lookup)
 
     # U.S. House (current year + previous year for cross-year sessions)
     current_year = datetime.now().year
     for year in sorted({current_year - 1, current_year}):
-        run(fetch_house_votes(year, cg_key), f"house-{year}")
+        run(fetch_house_votes(year, cg_key), f"house-{year}", federal_lookup)
 
     # U.S. Senate (session 1 and session 2 of current Congress)
     for session in (1, 2):
-        run(fetch_senate_votes(CURRENT_CONGRESS, session, cg_key), f"senate-s{session}")
+        run(fetch_senate_votes(CURRENT_CONGRESS, session, cg_key), f"senate-s{session}", federal_lookup)
 
     if UNMATCHED:
         log.info("Unmatched names (no official row found), most frequent first:")
