@@ -1,6 +1,6 @@
 name: Sync officials
 
-# Federal and state legislators (Congress.gov, Open States) and county officials (MRSC).
+# Federal and state legislators (Congress.gov, Open States), county officials, and the nine statewide offices.
 on:
   schedule:
     - cron: "17 10 * * 1"   # Mondays 10:17 UTC
@@ -26,3 +26,5 @@ jobs:
         run: python agents/data-sync.py
       - name: County officials
         run: python agents/county-sync.py
+      - name: Statewide officials
+        run: python agents/statewide-sync.py

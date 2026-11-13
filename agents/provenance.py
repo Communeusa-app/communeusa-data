@@ -27,6 +27,11 @@ def fields(key: str) -> dict:
     return {"source": name, "source_url": url, "last_verified_at": datetime.now(timezone.utc).isoformat()}
 
 
+def fields_for(source: str, source_url: str) -> dict:
+    """Provenance columns for a source that is not in the SOURCES table."""
+    return {"source": source, "source_url": source_url, "last_verified_at": datetime.now(timezone.utc).isoformat()}
+
+
 def stamp(supabase, ids: list[str], key: str) -> int:
     """Mark existing rows as confirmed by their source right now. Returns the number stamped."""
     ids = [i for i in dict.fromkeys(ids) if i]
