@@ -51,6 +51,18 @@ PLACE_WORDS = ("washington", "united states", "american")
 SUFFIXES = {"jr", "sr", "ii", "iii", "iv"}
 
 
+def get(url: str, **kw) -> requests.Response:
+    """GET with retries. Wikipedia answers 429 when asked too fast, so back off and try again."""
+    for attempt in range(6):
+        r = requests.get(url, headers=HEADERS, timeout=30, **kw)
+        if r.status_code not in (429, 500, 502, 503, 504):
+            return r
+        wait = int(r.headers.get("Retry-After", "0") or 0) or 2 ** (attempt + 1)
+        log.info("    Wikipedia asked us to slow down (HTTP %s), waiting %ss", r.status_code, min(wait, 60))
+        time.sleep(min(wait, 60))
+    return r
+
+
 def name_tokens(name: str) -> list[str]:
     name = re.sub(r"\(.*?\)|\".*?\"", " ", name)
     toks = [t.lower().strip(".,") for t in re.split(r"[\s]+", name) if t.strip(".,")]
@@ -83,19 +95,22 @@ def trim(text: str) -> str:
 def find_bio(name: str) -> tuple[dict | None, str]:
     """Return (match, reason). match has title, url, text."""
     try:
-        r = requests.get(API, headers=HEADERS, timeout=30, params={
+        r = get(API, params={
             "action": "query", "list": "search", "format": "json", "srlimit": 5,
             "srsearch": f'"{name}" Washington politician'})
         r.raise_for_status()
         hits = [h["title"] for h in r.json().get("query", {}).get("search", [])]
+        # Also try the article titles Wikipedia usually uses, in case search does not surface them.
+        for guess in (name, f"{name} (politician)", f"{name} (Washington politician)"):
+            if guess not in hits:
+                hits.append(guess)
     except (requests.RequestException, ValueError) as exc:
         return None, f"search failed: {exc}"
     for title in hits:
         if not title_matches(name, title):
             continue
         try:
-            s = requests.get(SUMMARY + urllib.parse.quote(title.replace(" ", "_"), safe=""),
-                             headers=HEADERS, timeout=30)
+            s = get(SUMMARY + urllib.parse.quote(title.replace(" ", "_"), safe=""))
             if s.status_code != 200:
                 continue
             j = s.json()
@@ -152,7 +167,7 @@ def main() -> int:
     skipped_names = []
     for r in todo:
         m, why = find_bio(r["official_name"])
-        time.sleep(0.3)
+        time.sleep(1.0)
         if not m:
             skipped += 1
             skipped_names.append(f'{r["official_name"]} ({why})')
