@@ -1,0 +1,31 @@
+name: Sync role types
+
+# Labels officials as elected or appointed from certified results and the reviewed known-appointed list.
+# Run this before Sync county terms (county terms marks matched county officials Elected only when blank).
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Report what would change without saving"
+        type: boolean
+        default: true
+
+concurrency:
+  group: sync-role-types
+  cancel-in-progress: false
+
+jobs:
+  terms:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup
+      - name: Label elected or appointed
+        run: |
+          ARGS=""
+          if [ "${{ inputs.dry_run }}" = "true" ]; then ARGS="--dry-run"; fi
+          python agents/role-type-sync.py $ARGS
