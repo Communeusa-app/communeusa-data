@@ -540,7 +540,7 @@ def fetch_house_votes(year: int, congress_key: str) -> list[dict]:
 
 def find_max_senate_vote(congress: int, session: int) -> int:
     """Binary search for the highest existing Senate vote number for a congress/session."""
-    lo, hi = 1, 500
+    lo, hi = 1, 1500  # a session can run past 500 roll calls (119/1 did)
     while lo < hi:
         mid = (lo + hi + 1) // 2
         url = (f"{SENATE_VOTE_BASE}/vote{congress}{session}/"
