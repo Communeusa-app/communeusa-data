@@ -46,7 +46,8 @@ SUFFIXES = {"jr", "sr", "ii", "iii", "iv"}
 STATE_CLASSES = [
     # Official titles read "State Senate" / "State House of Representatives"; race names say "Senator" / "Representative".
     ("senator", r"\bsenat(?:or|e)\b"),
-    ("representative", r"\b(?:representatives?|rep)\b"),
+    # Certified race names read "Washington State House District 48 Position 1".
+    ("representative", r"\b(?:representatives?|rep|house)\b"),
     ("governor", r"\bgovernor\b"),
     ("secretary of state", r"secretary of state"),
     ("attorney general", r"attorney general"),
