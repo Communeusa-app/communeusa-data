@@ -424,12 +424,16 @@ HOUSE_HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; CommuneUSA-bot/1.0; +ht
 
 
 def house_roll_exists(url: str) -> bool:
-    """HEAD requests to clerk.house.gov are not reliable, so ask with a streamed GET and read nothing."""
+    """True only when the URL is a real roll call XML file.
+
+    clerk.house.gov answers HTTP 200 for roll numbers that do not exist (it serves an ordinary page),
+    so the status code proves nothing. A real roll call is XML with a <rollcall-vote> root.
+    """
     try:
-        with requests.get(url, headers=HOUSE_HEADERS, timeout=20, stream=True) as r:
-            return r.status_code == 200
+        r = requests.get(url, headers=HOUSE_HEADERS, timeout=20)
     except Exception:
         return False
+    return r.status_code == 200 and b"<rollcall-vote" in r.content[:5000]
 
 
 def find_max_house_roll(year: int) -> int:
@@ -445,6 +449,13 @@ def find_max_house_roll(year: int) -> int:
     if lo == 1 and not house_roll_exists(f"{HOUSE_CLERK_BASE}/{year}/roll001.xml"):
         log.warning("House %d: could not reach the Clerk's roll call feed", year)
         return 0
+    # Show what the Clerk returns at the boundary so a wrong answer is easy to spot in the log.
+    for n in (lo, lo + 1):
+        try:
+            r = requests.get(f"{HOUSE_CLERK_BASE}/{year}/roll{n:03d}.xml", headers=HOUSE_HEADERS, timeout=20)
+            log.info("House %d roll %03d: HTTP %s, %d bytes, starts %r", year, n, r.status_code, len(r.content), r.content[:60])
+        except Exception as exc:
+            log.info("House %d roll %03d: %s", year, n, exc)
     return lo
 
 
