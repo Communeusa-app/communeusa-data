@@ -101,7 +101,7 @@ def main() -> int:
     this_year = datetime.now(timezone.utc).year
 
     officials = fetch_all(lambda: sb.table("officials")
-        .select("id,official_name,office_title,party,term_start,term_end,district,county_id,counties(name)")
+        .select("id,official_name,office_title,party,term_start,term_end,district,county_id,appointed_or_elected,counties(name)")
         .eq("level", "county").eq("is_active", True).order("id"))
     elections = fetch_all(lambda: sb.table("elections")
         .select("id,office_name,election_date,election_type,county_id")
@@ -127,7 +127,7 @@ def main() -> int:
         })
 
     updates, term_rows, no_win, corrections, needs_review = [], [], [], [], []
-    filled_party = fixed_terms = 0
+    filled_party = fixed_terms = labelled_elected = 0
     for o in officials:
         key = name_key(o["official_name"])
         county = (o.get("counties") or {}).get("name") or "?"
@@ -148,6 +148,9 @@ def main() -> int:
         mine.sort(key=lambda w: w["year"])
         latest = mine[-1]
         change: dict = {}
+        if not (o.get("appointed_or_elected") or "").strip():
+            change["appointed_or_elected"] = "Elected"  # won a certified race for this office
+            labelled_elected += 1
 
         ballot_party = PARTY_MAP.get(latest["party"].lower())
         stored_party = (o.get("party") or "").strip()
@@ -192,8 +195,8 @@ def main() -> int:
         log.info("%s (%s): %s", name, county, change)
     if len(updates) > 80:
         log.info("... and %d more", len(updates) - 80)
-    log.info("%d officials matched to a win; party filled for %d; term dates set or corrected for %d; %d history rows",
-             len(officials) - len(no_win), filled_party, fixed_terms, len(term_rows))
+    log.info("%d officials matched to a win; party filled for %d; term dates set or corrected for %d; %d history rows; %d marked Elected",
+             len(officials) - len(no_win), filled_party, fixed_terms, len(term_rows), labelled_elected)
     for c in corrections:
         log.warning("PARTY CORRECTED: %s", c)
     for r in needs_review:

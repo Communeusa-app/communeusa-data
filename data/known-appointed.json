@@ -1,0 +1,13 @@
+{
+  "_about": "Officials confirmed to hold their seat by appointment rather than a vote. role-type-sync writes 'Appointed' for anyone listed here, and a name here is never changed to Elected by a loose match. Add a person only with a source you checked. Remove the entry when they leave the seat.",
+  "appointed": [
+    {
+      "name": "Nora Bennett",
+      "level": "county",
+      "office_contains": "treasury",
+      "how": "Hired through a competitive recruitment as King County Chief Treasury Officer, not elected",
+      "source_url": "https://kcemployees.com/2023/09/15/nora-bennett-named-chief-treasury-officer/",
+      "added": "2026-11-25"
+    }
+  ]
+}
