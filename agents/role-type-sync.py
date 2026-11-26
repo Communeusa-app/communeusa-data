@@ -46,7 +46,7 @@ SUFFIXES = {"jr", "sr", "ii", "iii", "iv"}
 STATE_CLASSES = [
     # Official titles read "State Senate" / "State House of Representatives"; race names say "Senator" / "Representative".
     ("senator", r"\bsenat(?:or|e)\b"),
-    ("representative", r"\brepresentatives?\b"),
+    ("representative", r"\b(?:representatives?|rep)\b"),
     ("governor", r"\bgovernor\b"),
     ("secretary of state", r"secretary of state"),
     ("attorney general", r"attorney general"),
@@ -109,6 +109,7 @@ def main() -> int:
     winners = fetch_all(lambda: sb.table("candidates")
         .select("election_id,name,official_id").eq("outcome", "won").order("id"))
     wins: dict[str, list[dict]] = defaultdict(list)  # class -> wins
+    unclassified: dict[str, int] = defaultdict(int)
     for w in winners:
         e = by_election.get(w["election_id"])
         if not e or e["level"] != "state" or (e.get("election_type") or "general") != "general":
@@ -116,6 +117,13 @@ def main() -> int:
         cls = state_class(e["office_name"])
         if cls:
             wins[cls].append({"key": name_key(w["name"]), "official_id": w.get("official_id")})
+        else:
+            unclassified[e["office_name"]] += 1
+    # Diagnostics: shows whether House races are in the data and what they are called.
+    log.info("Certified state wins by office kind: %s", {k: len(v) for k, v in sorted(wins.items())})
+    log.info("State race names not recognised (%d), for example:", len(unclassified))
+    for n, c in sorted(unclassified.items(), key=lambda x: -x[1])[:25]:
+        log.info("    %s (%d wins)", n, c)
 
     appointed = known_appointed()
     updates: list[tuple[str, str, str, str]] = []  # id, name, value, reason
