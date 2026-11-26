@@ -143,7 +143,12 @@ def main() -> int:
         elif o["level"] == "state":
             cls = state_class(title)
             key = name_key(name)
-            matched = cls and any(w["official_id"] == o["id"] or (key and w["key"] == key) for w in wins.get(cls, []))
+            pool = wins.get(cls, []) if cls else []
+            matched = bool(cls) and any(w["official_id"] == o["id"] or (key and w["key"] == key) for w in pool)
+            if cls and not matched and key:
+                # Nicknames (Dave / David): same last name and first initial, only when exactly one winner fits.
+                loose = {w["key"] for w in pool if w["key"] and w["key"][1] == key[1] and w["key"][0][:1] == key[0][:1]}
+                matched = len(loose) == 1
             if matched:
                 updates.append((o["id"], name, "Elected", "matches a certified winning race"))
             else:
