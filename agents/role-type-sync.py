@@ -44,8 +44,9 @@ SUFFIXES = {"jr", "sr", "ii", "iii", "iv"}
 
 # Kinds of state office, matched on both the official's title and the race name.
 STATE_CLASSES = [
-    ("senator", r"\bsenator\b"),
-    ("representative", r"\brepresentative\b"),
+    # Official titles read "State Senate" / "State House of Representatives"; race names say "Senator" / "Representative".
+    ("senator", r"\bsenat(?:or|e)\b"),
+    ("representative", r"\brepresentatives?\b"),
     ("governor", r"\bgovernor\b"),
     ("secretary of state", r"secretary of state"),
     ("attorney general", r"attorney general"),
